@@ -364,7 +364,15 @@ class Pipe:
                 prev_q = prev_q[:120]
                 current = {
                     "role": "user",
-                    "content": f"{cur_text}\n(앞 질문 '{prev_q}' 에 이어지는 질문. 환경이나 문서 내용이 필요하면 주제를 넣은 문장으로 도구를 부름)",
+                    # The first wording made the model resend the earlier
+                    # question verbatim as the tool request (10-22, F3 Q2:
+                    # "해결방법" became a second log search). Ask for the new
+                    # words plus the earlier subject instead.
+                    "content": (
+                        f"{cur_text}\n(앞 질문 '{prev_q}' 의 주제에 대한 '{bare}'. "
+                        f"도구가 필요하면 request 에 '{bare}' 를 꼭 넣고 앞 질문의 주제 낱말을 붙임 -- "
+                        f"앞 질문 문장을 그대로 다시 보내지 않음)"
+                    ),
                 }
         return system + shaped + [current]
 

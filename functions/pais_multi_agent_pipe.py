@@ -114,6 +114,12 @@ class Pipe:
             default=True,
             description="이전과 같은(거의 같은) 질문이면 '값이 바뀌었을 수 있으니 도구를 다시 호출' 한 줄을 붙임.",
         )
+        # A fix question sent wrapped in backticks got no tool call and a made-up KB
+        # answer ("근거 일치도: ★★★ 높음", no KB number, no link; 159 F1 10-23 01:00).
+        TOOL_HINT: bool = Field(
+            default=True,
+            description="해결·방법 질문이나 영어 오류 문구가 든 질문에 '도구(KB 검색)로 답함' 한 줄을 붙임.",
+        )
         FOLLOWUP_HINT: bool = Field(
             default=True,
             description="짧은 후속 질문('잠금 해제 방법' 등)에 앞 질문을 붙여 도구 호출을 유도.",
@@ -284,6 +290,41 @@ class Pipe:
     _ANSWER_STUB = "(이전 답 — 본문 생략)"
     _TABLE_ROWS = "(표 {n}행 생략 — 첫 열: {names}; 지금 값은 도구로 다시 조회)"
     _SAME_QUESTION = "(같은 질문: 값이 바뀌었을 수 있으니 도구를 다시 호출)"
+    _TOOL_HINT = (
+        "(이 질문은 도구로 답함: 오류·해결 방법은 vcenter_query/nsx_query 의 KB 검색. "
+        "앞 답이나 기억으로 KB 를 쓰지 않음)"
+    )
+    # A fix or how-to question (close to the gateway's is_how_to/asks_kb_resolution).
+    _HOW_TO = (
+        r"해결|조치|고치|방법|절차|어떻게|해결책|(?<![A-Za-z])how\s+(?:to|do|can|should)(?![A-Za-z])"
+        r"|(?<![A-Za-z])(?:fix|resolve|resolution|workaround|troubleshoot)"
+    )
+    # An English error text: four or more Latin words in a row.
+    _ENGLISH_ERROR = r"[A-Za-z][A-Za-z'’-]*(?:\s+[A-Za-z][A-Za-z'’-]*){3,}"
+    _CHIT_CHAT = r"안녕|감사|고마|수고|누구|뭐\s*할\s*수|무엇을\s*할\s*수|hello|thanks?"
+    # The whole message in one wrapper: ```…```, `…`, "…", '…', “…”, ‘…’, 「…」, 『…』.
+    _WRAPPERS = (("```", "```"), ("`", "`"), ('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"),
+                 ("「", "」"), ("『", "』"))
+
+    @classmethod
+    def _unwrap(cls, text: str) -> str:
+        """The message without a wrapper around ALL of it. A quote inside a sentence ("… 'vmk1' 가
+        들어간 줄") stays: only a message that starts and ends with one wrapper, holding no other
+        copy of it, is unwrapped -- the model read the backticked sentence as a block to answer."""
+        import re
+
+        t = (text or "").strip()
+        for left, right in cls._WRAPPERS:
+            if len(t) > len(left) + len(right) and t.startswith(left) and t.endswith(right):
+                inner = t[len(left):len(t) - len(right)]
+                if left == "```" and "\n" in inner:
+                    # A fence may name a language on its first line ("```text").
+                    head, rest = inner.split("\n", 1)
+                    if re.fullmatch(r"[A-Za-z0-9_+-]{0,12}", head.strip()) and rest.strip():
+                        inner = rest
+                if left not in inner and right not in inner and inner.strip():
+                    return inner.strip()
+        return t
     # A typed question number, either case: "Q4 ...", "q1. ...".
     _QLABEL = r"^\s*[Qq]\d+[.):]?\s*"
     # "나머지 보여줘" and its variants; a sentence with more in it is a new question.
@@ -395,6 +436,12 @@ class Pipe:
         # Spell out the call it should make; the server keeps the page.
         cur_text = self._text_of(current.get("content")).strip()
         bare = re.sub(self._QLABEL, "", cur_text)
+        unwrapped = self._unwrap(bare)
+        if unwrapped != bare:
+            cur_text = cur_text[: len(cur_text) - len(bare)] + unwrapped
+            bare = unwrapped
+            current = {"role": "user", "content": cur_text}
+        plain = current
         is_paging = bool(re.fullmatch(self._PAGING, bare, re.I))
         if is_paging:
             prev_tool = None
@@ -408,6 +455,8 @@ class Pipe:
         elif (
             self.valves.FOLLOWUP_HINT
             and len(bare) <= int(self.valves.FOLLOWUP_MAX_CHARS)
+            # A greeting is not a follow-up: the line asked for a tool call (159, 10-23).
+            and not re.search(self._CHIT_CHAT, bare, re.I)
             # A sentence that names its own subject (a product, an object, a
             # Latin term) is a new question, not a follow-up.
             and not re.search(
@@ -470,6 +519,15 @@ class Pipe:
                         "content": f"{self._text_of(current.get('content'))}\n{self._SAME_QUESTION}",
                     }
                     break
+        if (
+            self.valves.TOOL_HINT
+            and not is_paging
+            # One hint per message: the follow-up and same-question lines already ask for a call.
+            and current is plain
+            and not re.search(self._CHIT_CHAT, bare, re.I)
+            and (re.search(self._HOW_TO, bare, re.I) or re.search(self._ENGLISH_ERROR, bare))
+        ):
+            current = {"role": "user", "content": f"{cur_text}\n{self._TOOL_HINT}"}
         return system + shaped + [current]
 
     # ------------------------------------------------------------------

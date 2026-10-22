@@ -289,7 +289,7 @@ class Pipe:
     # "나머지 보여줘" and its variants; a sentence with more in it is a new question.
     _PAGING = (
         r"(?:나머지|다음|더|계속)\s*(?:도|를|은)?\s*(?:페이지|거|것)?\s*(?:도|를)?\s*"
-        r"(?:보여\s*줘|보여\s*주세요|보여\s*줄래|줘|주세요|보기|해\s*줘)?[.!?]?"
+        r"(?:보여\s*줘|보여\s*주세요|보여\s*줄래|알려\s*줘|알려\s*주세요|줘|주세요|보기|해\s*줘)?[.!?]?"
         r"|more|next(?:\s*page)?|continue"
     )
 
@@ -312,11 +312,12 @@ class Pipe:
         lines = text.split("\n")
         out, i = [], 0
         while i < len(lines):
-            if i + 1 < len(lines) and lines[i].lstrip().startswith("|") and table_mark.match(lines[i + 1]):
+            # Leading pipes are optional in markdown ("a | b" over "---|---").
+            if i + 1 < len(lines) and "|" in lines[i] and table_mark.match(lines[i + 1]):
                 out.append(lines[i])
                 i += 2
                 firsts = []
-                while i < len(lines) and lines[i].lstrip().startswith("|"):
+                while i < len(lines) and "|" in lines[i] and lines[i].strip():
                     cells = lines[i].strip().strip("|").split("|")
                     firsts.append(cells[0].strip() if cells else "")
                     i += 1
@@ -442,11 +443,28 @@ class Pipe:
             # earlier answer with no tool call (BRCM-MCP #57 section 3, 10-22
             # 14:18). Every earlier question counts, also the ones MAX_HISTORY_TURNS
             # dropped: the model may still have answered it from what it kept.
+            # Only when the earlier answer came from a tool: a repeated greeting needs no
+            # tool call, and the hint made the model call one (2nd QA M-B).
+            tool_answer = re.compile(
+                r"vcenter_query|nsx_query|ops_query|ops_top_n|ops_get_metric|logs_query|logs_incident"
+                r"|logs_correlate|본문 생략|행 생략"
+            )
+            chit_chat = re.compile(r"안녕|감사|고마|수고|누구|뭐\s*할\s*수|무엇을\s*할\s*수|hello|thanks?", re.I)
             now = self._same_text(bare)
-            for m in turns[:last_user]:
+            for j, m in enumerate(turns[:last_user]):
                 if m.get("role") != "user":
                     continue
-                if len(now) >= 4 and self._same_text(self._text_of(m.get("content"))) == now:
+                reply = turns[j + 1] if j + 1 < last_user else {}
+                reply_text = self._text_of(reply.get("content")) if reply.get("role") == "assistant" else ""
+                from_tool = bool(
+                    table_mark.search(reply_text) or kb_mark.search(reply_text) or tool_answer.search(reply_text)
+                )
+                if (
+                    len(now) >= 4
+                    and from_tool
+                    and not chit_chat.search(bare)
+                    and self._same_text(self._text_of(m.get("content"))) == now
+                ):
                     current = {
                         "role": "user",
                         "content": f"{self._text_of(current.get('content'))}\n{self._SAME_QUESTION}",

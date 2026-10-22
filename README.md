@@ -22,8 +22,13 @@ Authentik OAuth2 password grant 로 토큰을 받는다.
 | `HISTORY_MODE` | `strip_kb` | `full` 이력 그대로 / `strip_kb` KB 가 든 이전 답은 짧은 표시로 / `user_only` 이전 답 모두 짧은 표시로 / `last_only` 마지막 질문만 |
 | `MAX_HISTORY_TURNS` | 6 | 마지막 질문 앞에 남길 이전 대화 쌍 수 |
 | `KEEP_ANSWER_CHARS` | 600 | KB 가 아닌 이전 답을 남길 글자 수 |
+| `STRIP_TABLES` | 켬 | (10-22 추가) `strip_kb` 에서 마크다운 표(`|---|` 줄)가 든 이전 답도 "(이전 표 답, 본문 생략 — 지금 값은 도구로 다시 조회)" 로 |
+| `SAME_QUESTION_HINT` | 켬 | (10-22 추가) 같은 채팅에서 이전과 같은(거의 같은) 질문이면 "(같은 질문: 값이 바뀌었을 수 있으니 도구를 다시 호출)" 한 줄을 붙임. "나머지 보여줘" 는 제외 |
 | `FOLLOWUP_HINT` | 켬 | 주제 없는 짧은 후속 질문("잠금 해제 방법")에 앞 질문을 붙여 넘김 |
 | `FOLLOWUP_MAX_CHARS` | 25 | 후속 질문으로 볼 최대 글자 수 |
 | `FORCE_TOOL_CHOICE` | 끔 | (실험) `tool_choice=required`. PAIS 가 받는지 쇼 뒤에 시험 |
 
 "나머지 보여줘" 류는 바로 앞 답의 도구로 이어 보기를 부르라는 한 줄을 붙여 넘긴다. 화면의 질문은 바뀌지 않는다.
+
+같은 채팅에서 앞 표를 그대로 반복하거나 없는 행을 지어 붙이던 문제(BRCM-MCP #57 3절, F2 Q4)는 위 두 Valve 로 막는다.
+앞 표가 모델에게 보이지 않으므로 표 값을 다시 물으면 도구를 불러야 한다. 두 Valve 를 끄면 10-22 이전 동작과 같다.

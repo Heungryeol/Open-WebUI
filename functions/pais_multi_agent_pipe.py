@@ -102,6 +102,18 @@ class Pipe:
             default=600,
             description="strip_kb 에서 KB 가 아닌 이전 답을 남길 최대 글자 수.",
         )
+        # An earlier TABLE was repeated as the answer to the same question, and once
+        # rewritten into a table with datastores that do not exist (BRCM-MCP #57
+        # section 3, 10-22 F2 Q4): no tool was called. strip_kb now also replaces
+        # an earlier answer that holds a markdown table, so there is no table to copy.
+        STRIP_TABLES: bool = Field(
+            default=True,
+            description="strip_kb 에서 마크다운 표(|---| 줄)가 든 이전 답도 짧은 표시로 바꿈.",
+        )
+        SAME_QUESTION_HINT: bool = Field(
+            default=True,
+            description="이전과 같은(거의 같은) 질문이면 '값이 바뀌었을 수 있으니 도구를 다시 호출' 한 줄을 붙임.",
+        )
         FOLLOWUP_HINT: bool = Field(
             default=True,
             description="짧은 후속 질문('잠금 해제 방법' 등)에 앞 질문을 붙여 도구 호출을 유도.",
@@ -270,6 +282,16 @@ class Pipe:
     # where "나머지 보여줘" goes without showing it any KB text to copy.
     _KB_STUB = "(KB 문서 답, {tool} 결과 — 본문 생략)"
     _ANSWER_STUB = "(이전 답 — 본문 생략)"
+    _TABLE_STUB = "(이전 표 답, 본문 생략 — 지금 값은 도구로 다시 조회)"
+    _SAME_QUESTION = "(같은 질문: 값이 바뀌었을 수 있으니 도구를 다시 호출)"
+
+    @staticmethod
+    def _same_text(text: str) -> str:
+        # Spacing, case, punctuation and a typed "Q4" label do not make a new question.
+        import re
+
+        bare = re.sub(r"^\s*Q\d+[.):]?\s*", "", text or "")
+        return re.sub(r"[\s.,!?~·]+", "", bare).lower()
 
     @staticmethod
     def _text_of(content) -> str:
@@ -309,6 +331,8 @@ class Pipe:
         earlier = earlier[-keep:] if keep else []
 
         kb_mark = re.compile(r"\bKB\s*\d{5,}|knowledge\.broadcom\.com|근거\s*일치도")
+        # A markdown table's separator row: "|---|---|", "| :--- | ---: |".
+        table_mark = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*\|", re.M)
         shaped = []
         for m in earlier:
             if m.get("role") != "assistant":
@@ -322,6 +346,10 @@ class Pipe:
                 else:
                     stub = self._ANSWER_STUB
                 shaped.append({"role": "assistant", "content": stub})
+            elif self.valves.STRIP_TABLES and table_mark.search(text):
+                # Declarative, like the KB stub: values in an old table are stale
+                # by the next question, and a table in view was copied or extended.
+                shaped.append({"role": "assistant", "content": self._TABLE_STUB})
             else:
                 limit = max(0, int(self.valves.KEEP_ANSWER_CHARS))
                 cut = text if len(text) <= limit else text[:limit] + " …(생략)"
@@ -332,7 +360,10 @@ class Pipe:
         # Spell out the call it should make; the server keeps the page.
         cur_text = self._text_of(current.get("content")).strip()
         bare = re.sub(r"^\s*Q\d+[.):]?\s*", "", cur_text)
-        if re.fullmatch(r"(나머지|다음|더)\s*(보여\s*줘|보여\s*주세요|줘|보기)?[.!?]?|more|next", bare, re.I):
+        is_paging = bool(
+            re.fullmatch(r"(나머지|다음|더)\s*(보여\s*줘|보여\s*주세요|줘|보기)?[.!?]?|more|next", bare, re.I)
+        )
+        if is_paging:
             prev_tool = None
             for m in reversed(shaped):
                 if m.get("role") == "assistant":
@@ -374,6 +405,26 @@ class Pipe:
                         f"앞 질문 문장을 그대로 다시 보내지 않음)"
                     ),
                 }
+        if self.valves.SAME_QUESTION_HINT and not is_paging:
+            # The same sentence again in one chat was answered by repeating the
+            # earlier answer with no tool call (BRCM-MCP #57 section 3, 10-22
+            # 14:18). Every earlier question counts, also the ones MAX_HISTORY_TURNS
+            # dropped: the model may still have answered it from what it kept.
+            import difflib
+
+            now = self._same_text(bare)
+            for m in turns[:last_user]:
+                if m.get("role") != "user":
+                    continue
+                before = self._same_text(self._text_of(m.get("content")))
+                if len(now) >= 4 and (
+                    before == now or difflib.SequenceMatcher(None, before, now).ratio() >= 0.9
+                ):
+                    current = {
+                        "role": "user",
+                        "content": f"{self._text_of(current.get('content'))}\n{self._SAME_QUESTION}",
+                    }
+                    break
         return system + shaped + [current]
 
     # ------------------------------------------------------------------

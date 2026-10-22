@@ -417,8 +417,14 @@ class Pipe:
                 if m.get("role") != "user":
                     continue
                 before = self._same_text(self._text_of(m.get("content")))
+                # Near-equal only with the same numbers: "esx08 CPU 사용률" and
+                # "esx09 CPU 사용률" differ by one character and are not the same question.
                 if len(now) >= 4 and (
-                    before == now or difflib.SequenceMatcher(None, before, now).ratio() >= 0.9
+                    before == now
+                    or (
+                        re.findall(r"\d+", before) == re.findall(r"\d+", now)
+                        and difflib.SequenceMatcher(None, before, now).ratio() >= 0.9
+                    )
                 ):
                     current = {
                         "role": "user",

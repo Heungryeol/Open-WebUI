@@ -282,16 +282,50 @@ class Pipe:
     # where "나머지 보여줘" goes without showing it any KB text to copy.
     _KB_STUB = "(KB 문서 답, {tool} 결과 — 본문 생략)"
     _ANSWER_STUB = "(이전 답 — 본문 생략)"
-    _TABLE_STUB = "(이전 표 답, 본문 생략 — 지금 값은 도구로 다시 조회)"
+    _TABLE_ROWS = "(표 {n}행 생략 — 첫 열: {names}; 지금 값은 도구로 다시 조회)"
     _SAME_QUESTION = "(같은 질문: 값이 바뀌었을 수 있으니 도구를 다시 호출)"
+    # A typed question number, either case: "Q4 ...", "q1. ...".
+    _QLABEL = r"^\s*[Qq]\d+[.):]?\s*"
+    # "나머지 보여줘" and its variants; a sentence with more in it is a new question.
+    _PAGING = (
+        r"(?:나머지|다음|더|계속)\s*(?:도|를|은)?\s*(?:페이지|거|것)?\s*(?:도|를)?\s*"
+        r"(?:보여\s*줘|보여\s*주세요|보여\s*줄래|줘|주세요|보기|해\s*줘)?[.!?]?"
+        r"|more|next(?:\s*page)?|continue"
+    )
 
-    @staticmethod
-    def _same_text(text: str) -> str:
-        # Spacing, case, punctuation and a typed "Q4" label do not make a new question.
+    @classmethod
+    def _same_text(cls, text: str) -> str:
+        # Only form is ignored -- spacing, punctuation, case, a "Q4" label and a
+        # polite ending ("보여줘" / "보여 주세요" / "보여요"). QA on 522e1cc: a 0.9
+        # similarity marked "전원이 켜진 VM" after "전원이 꺼진 VM" as the same question.
         import re
 
-        bare = re.sub(r"^\s*Q\d+[.):]?\s*", "", text or "")
-        return re.sub(r"[\s.,!?~·]+", "", bare).lower()
+        bare = re.sub(cls._QLABEL, "", text or "")
+        bare = re.sub(r"[\s.,!?~·]+", "", bare).lower()
+        return re.sub(r"(?:주세요|줘요|줘|요)$", "", bare)
+
+    @classmethod
+    def _compact_tables(cls, text: str, table_mark) -> str:
+        """Each markdown table keeps its header row; its data rows become one line naming up to
+        eight first-column values. QA on 81b561b: replacing the whole answer lost what "그 호스트
+        로그 보여줘" points at; the values themselves stay out so there is nothing to copy."""
+        lines = text.split("\n")
+        out, i = [], 0
+        while i < len(lines):
+            if i + 1 < len(lines) and lines[i].lstrip().startswith("|") and table_mark.match(lines[i + 1]):
+                out.append(lines[i])
+                i += 2
+                firsts = []
+                while i < len(lines) and lines[i].lstrip().startswith("|"):
+                    cells = lines[i].strip().strip("|").split("|")
+                    firsts.append(cells[0].strip() if cells else "")
+                    i += 1
+                shown = ", ".join(f for f in firsts[:8] if f) + (" …" if len(firsts) > 8 else "")
+                out.append(cls._TABLE_ROWS.format(n=len(firsts), names=shown or "-"))
+                continue
+            out.append(lines[i])
+            i += 1
+        return "\n".join(out)
 
     @staticmethod
     def _text_of(content) -> str:
@@ -346,11 +380,11 @@ class Pipe:
                 else:
                     stub = self._ANSWER_STUB
                 shaped.append({"role": "assistant", "content": stub})
-            elif self.valves.STRIP_TABLES and table_mark.search(text):
-                # Declarative, like the KB stub: values in an old table are stale
-                # by the next question, and a table in view was copied or extended.
-                shaped.append({"role": "assistant", "content": self._TABLE_STUB})
             else:
+                if self.valves.STRIP_TABLES and table_mark.search(text):
+                    # Declarative, like the KB stub: values in an old table are stale
+                    # by the next question, and a table in view was copied or extended.
+                    text = self._compact_tables(text, table_mark)
                 limit = max(0, int(self.valves.KEEP_ANSWER_CHARS))
                 cut = text if len(text) <= limit else text[:limit] + " …(생략)"
                 shaped.append({"role": "assistant", "content": cut})
@@ -359,10 +393,8 @@ class Pipe:
         # paragraph about `more` values instead of calling the tool (10-22).
         # Spell out the call it should make; the server keeps the page.
         cur_text = self._text_of(current.get("content")).strip()
-        bare = re.sub(r"^\s*Q\d+[.):]?\s*", "", cur_text)
-        is_paging = bool(
-            re.fullmatch(r"(나머지|다음|더)\s*(보여\s*줘|보여\s*주세요|줘|보기)?[.!?]?|more|next", bare, re.I)
-        )
+        bare = re.sub(self._QLABEL, "", cur_text)
+        is_paging = bool(re.fullmatch(self._PAGING, bare, re.I))
         if is_paging:
             prev_tool = None
             for m in reversed(shaped):
@@ -389,7 +421,7 @@ class Pipe:
             prev_q = None
             for m in reversed(shaped):
                 if m.get("role") == "user":
-                    prev_q = re.sub(r"^\s*Q\d+[.):]?\s*", "", self._text_of(m.get("content"))).strip()
+                    prev_q = re.sub(self._QLABEL, "", self._text_of(m.get("content"))).strip()
                     break
             if prev_q:
                 prev_q = prev_q[:120]
@@ -410,22 +442,11 @@ class Pipe:
             # earlier answer with no tool call (BRCM-MCP #57 section 3, 10-22
             # 14:18). Every earlier question counts, also the ones MAX_HISTORY_TURNS
             # dropped: the model may still have answered it from what it kept.
-            import difflib
-
             now = self._same_text(bare)
             for m in turns[:last_user]:
                 if m.get("role") != "user":
                     continue
-                before = self._same_text(self._text_of(m.get("content")))
-                # Near-equal only with the same numbers: "esx08 CPU 사용률" and
-                # "esx09 CPU 사용률" differ by one character and are not the same question.
-                if len(now) >= 4 and (
-                    before == now
-                    or (
-                        re.findall(r"\d+", before) == re.findall(r"\d+", now)
-                        and difflib.SequenceMatcher(None, before, now).ratio() >= 0.9
-                    )
-                ):
+                if len(now) >= 4 and self._same_text(self._text_of(m.get("content"))) == now:
                     current = {
                         "role": "user",
                         "content": f"{self._text_of(current.get('content'))}\n{self._SAME_QUESTION}",

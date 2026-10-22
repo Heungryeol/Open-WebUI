@@ -290,21 +290,77 @@ class Pipe:
     _ANSWER_STUB = "(이전 답 — 본문 생략)"
     _TABLE_ROWS = "(표 {n}행 생략 — 첫 열: {names}; 지금 값은 도구로 다시 조회)"
     _SAME_QUESTION = "(같은 질문: 값이 바뀌었을 수 있으니 도구를 다시 호출)"
+    # Names no tool: an Operations alert name ("Datastore is running out of disk space 조치
+    # 방법은?") is Operations' to answer, a log phrase the log tool's (3rd QA M4).
     _TOOL_HINT = (
-        "(이 질문은 도구로 답함: 오류·해결 방법은 vcenter_query/nsx_query 의 KB 검색. "
+        "(이 질문은 도구로 답함: 오류·해결은 KB 검색, 로그 줄은 로그 도구, 알림은 Operations. "
         "앞 답이나 기억으로 KB 를 쓰지 않음)"
     )
-    # A fix or how-to question (close to the gateway's is_how_to/asks_kb_resolution).
+    # A fix or how-to question (close to the gateway's is_how_to/asks_kb_resolution). Not
+    # "방법론" (methodology) and not a bare "어떻게" ("어떻게 지내", 3rd QA M4).
     _HOW_TO = (
-        r"해결|조치|고치|방법|절차|어떻게|해결책|(?<![A-Za-z])how\s+(?:to|do|can|should)(?![A-Za-z])"
+        r"해결|조치|고치|방법(?!론)|절차|어떻게\s*(?:해|하|고치|고쳐|해결|조치|복구|설정|확인|바꾸|바꿔|풀)"
+        r"|(?<![A-Za-z])how\s+(?:to|do\s+i|can\s+i|should\s+i)(?![A-Za-z])"
         r"|(?<![A-Za-z])(?:fix|resolve|resolution|workaround|troubleshoot)"
     )
-    # An English error text: four or more Latin words in a row.
-    _ENGLISH_ERROR = r"[A-Za-z][A-Za-z'’-]*(?:\s+[A-Za-z][A-Za-z'’-]*){3,}"
-    _CHIT_CHAT = r"안녕|감사|고마|수고|누구|뭐\s*할\s*수|무엇을\s*할\s*수|hello|thanks?"
+    # An English error text: four or more Latin words in a row WITH an error word -- "how are you
+    # doing today", "Nice to meet you all" are four Latin words too (3rd QA M4).
+    _ENGLISH_RUN = r"[A-Za-z][A-Za-z'’-]*(?:\s+[A-Za-z][A-Za-z'’-]*){3,}"
+    _ERROR_WORD = (
+        r"(?<![A-Za-z])(?:error|errors|fail|fails|failed|failure|unable|cannot|can't|no\s+more|denied"
+        r"|timeout|timed\s+out|not\s+responding|invalid|refused|not\s+found|unreachable|corrupt\w*"
+        r"|mismatch|did\s+not|has\s+been\s+modified|out\s+of\s+\w+)(?![A-Za-z])"
+    )
+    # Looking for log lines is the log tool's question; a fix word still wins ("감사 로그에서
+    # 로그인 실패 해결 방법"). "로그인" is a login, not a log.
+    _LOG_SEARCH = r"줄|로그(?!인)|찾아|검색|들어간|(?<![A-Za-z])logs?(?![A-Za-z])"
+    # Small talk, matched on the WHOLE message (3rd QA M5: "감사 로그" is an audit log, and a
+    # question after "안녕하세요," is still a question).
+    _GREETING = r"^\s*(?:안녕(?:하세요|하십니까|하신가요)?|hi|hello|hey|좋은\s*(?:아침|오후|저녁)(?:입니다|이에요)?)[\s,.!~]*"
+    _CHIT_CHAT = (
+        r"(?:감사(?:합니다|해요|해)?|고마워(?:요)?|고맙습니다|수고(?:하셨습니다|했어요|했어|하세요)?|잘했어(?:요)?"
+        r"|넌\s*누구(?:야|니)?|너는\s*누구(?:야|니)?|누구(?:세요|야)|뭐\s*할\s*수\s*있어|무엇을\s*할\s*수\s*있나요"
+        r"|어떻게\s*지내(?:요|세요)?|반가워(?:요)?|반갑습니다|좋아(?:요)?|네|응|알겠(?:어|습니다|어요)"
+        r"|thanks?(?:\s+(?:a\s+lot|you))?|thank\s+you|ok(?:ay)?|good|great|how\s+are\s+you(?:\s+doing)?(?:\s+today)?"
+        r"|nice\s+to\s+meet\s+you(?:\s+all)?|what\s+can\s+you\s+do(?:\s+for\s+me)?|who\s+are\s+you"
+        r"|can\s+you\s+speak\s+\w+|도움말|help)[\s.!?~]*"
+    )
+
+    @classmethod
+    def _needs_tool(cls, text: str) -> bool:
+        """A fix/how-to question, or an English error text that is not a log-line search."""
+        import re
+
+        if re.search(cls._HOW_TO, text, re.I):
+            return True
+        return bool(re.search(cls._ENGLISH_RUN, text) and re.search(cls._ERROR_WORD, text, re.I)
+                    and not re.search(cls._LOG_SEARCH, text, re.I))
+
+    @classmethod
+    def _drop_greeting(cls, text: str) -> str:
+        import re
+
+        return re.sub(cls._GREETING, "", text or "", flags=re.I).strip()
+
+    @classmethod
+    def _is_chit_chat(cls, text: str) -> bool:
+        """A short greeting, thanks or "who are you", and nothing else."""
+        import re
+
+        t = (text or "").strip()
+        if len(t) > 40:
+            return False
+        rest = cls._drop_greeting(t)
+        # One or more small-talk pieces ("네 알겠습니다", "감사합니다, 수고하세요").
+        return not rest or bool(re.fullmatch(rf"(?:{cls._CHIT_CHAT}[\s,]*)+", rest, re.I))
     # The whole message in one wrapper: ```…```, `…`, "…", '…', “…”, ‘…’, 「…」, 『…』.
     _WRAPPERS = (("```", "```"), ("`", "`"), ('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"),
                  ("「", "」"), ("『", "』"))
+    # Only a wrapped QUESTION is unwrapped: a quoted phrase alone ('"Update virtual NIC"') is a log
+    # phrase to look for, and the quotes say so (3rd QA L1).
+    _ASKS = r"방법|해결|조치|알려|보여|찾아|뭐야|있어|\?|(?<![A-Za-z])(?:how|what|why|fix|show)(?![A-Za-z])"
+    _FENCE_LANGS = ("bash", "sh", "shell", "zsh", "python", "py", "json", "yaml", "yml", "text", "txt",
+                    "console", "powershell", "ps1", "log", "ini", "xml", "sql")
 
     @classmethod
     def _unwrap(cls, text: str) -> str:
@@ -320,9 +376,10 @@ class Pipe:
                 if left == "```" and "\n" in inner:
                     # A fence may name a language on its first line ("```text").
                     head, rest = inner.split("\n", 1)
-                    if re.fullmatch(r"[A-Za-z0-9_+-]{0,12}", head.strip()) and rest.strip():
+                    if head.strip().lower() in cls._FENCE_LANGS + ("",) and rest.strip():
                         inner = rest
-                if left not in inner and right not in inner and inner.strip():
+                if (left not in inner and right not in inner and inner.strip()
+                        and re.search(cls._ASKS, inner, re.I)):
                     return inner.strip()
         return t
     # A typed question number, either case: "Q4 ...", "q1. ...".
@@ -456,7 +513,7 @@ class Pipe:
             self.valves.FOLLOWUP_HINT
             and len(bare) <= int(self.valves.FOLLOWUP_MAX_CHARS)
             # A greeting is not a follow-up: the line asked for a tool call (159, 10-23).
-            and not re.search(self._CHIT_CHAT, bare, re.I)
+            and not self._is_chit_chat(bare)
             # A sentence that names its own subject (a product, an object, a
             # Latin term) is a new question, not a follow-up.
             and not re.search(
@@ -498,7 +555,6 @@ class Pipe:
                 r"vcenter_query|nsx_query|ops_query|ops_top_n|ops_get_metric|logs_query|logs_incident"
                 r"|logs_correlate|본문 생략|행 생략"
             )
-            chit_chat = re.compile(r"안녕|감사|고마|수고|누구|뭐\s*할\s*수|무엇을\s*할\s*수|hello|thanks?", re.I)
             now = self._same_text(bare)
             for j, m in enumerate(turns[:last_user]):
                 if m.get("role") != "user":
@@ -511,7 +567,7 @@ class Pipe:
                 if (
                     len(now) >= 4
                     and from_tool
-                    and not chit_chat.search(bare)
+                    and not self._is_chit_chat(bare)
                     and self._same_text(self._text_of(m.get("content"))) == now
                 ):
                     current = {
@@ -524,8 +580,8 @@ class Pipe:
             and not is_paging
             # One hint per message: the follow-up and same-question lines already ask for a call.
             and current is plain
-            and not re.search(self._CHIT_CHAT, bare, re.I)
-            and (re.search(self._HOW_TO, bare, re.I) or re.search(self._ENGLISH_ERROR, bare))
+            and not self._is_chit_chat(bare)
+            and self._needs_tool(self._drop_greeting(bare))
         ):
             current = {"role": "user", "content": f"{cur_text}\n{self._TOOL_HINT}"}
         return system + shaped + [current]

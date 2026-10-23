@@ -605,8 +605,15 @@ class Pipe:
     # ---- Open WebUI background tasks (BRCM-MCP #64) ----
     NEXT_TITLE = "이어서 물어볼 만한 것:"
     MORE = "나머지 보여줘"
-    _MORE_LINE = re.compile(r"이어서\s*보려면\s*'나머지 보여줘'|'나머지 보여줘'\s*로")
+    # "이어서 보려면 '나머지 보여줘'" / "나머지 44건은 '나머지 보여줘' 로" in any quote style,
+    # but not "나머지 0개는 …" (a real misprint, vcenter tools.py 2026-10-16).
+    _Q = r"['\"‘’“”`]?"
+    _MORE_LINE = re.compile(r"이어서\s*보려면\s*" + _Q + r"나머지\s*보여\s*줘" + _Q
+                            + r"|나머지(?!\s*0\s*[개건대줄명곳])\s*[^\n]{0,30}?" + _Q + r"나머지\s*보여\s*줘" + _Q + r"\s*로")
     _END_LINE = re.compile(r"문서의\s*끝입니다")
+    # Heading variants seen from models: bold, "###", no colon, full-width colon.
+    _HEAD = re.compile(r"^\s*(?:#+\s*)?\**\s*(이어서\s*물어볼\s*만한\s*것|관련)\s*\**\s*[:：]?\s*\**\s*$")
+    _ITEM = re.compile(r"^(?:[-*•]|\d+[.)])\s+(.*)$")
 
     @staticmethod
     def _task_of(__task__, __metadata__) -> str:
@@ -640,36 +647,42 @@ class Pipe:
         """Chips are the answer's own list, copied: a chip is sent back word for word,
         so only sentences the server offered route and page correctly (#64)."""
         lines = (answer or "").splitlines()
-
-        def items_under(title: str) -> Optional[list]:
-            for i, line in enumerate(lines):
-                if line.strip().strip("*").strip() != title:
-                    continue
-                got = []
-                for nxt in lines[i + 1:]:
-                    t = nxt.strip()
-                    if not t:
-                        if got:
-                            break
-                        continue
-                    if not t.startswith(("- ", "* ")):
+        lists, listed = {}, set()
+        for i, line in enumerate(lines):
+            h = cls._HEAD.match(line)
+            if not h:
+                continue
+            key = "next" if h.group(1).startswith("이어서") else "related"
+            got = []
+            for j in range(i + 1, len(lines)):
+                raw = lines[j]
+                t = raw.strip()
+                if not t:
+                    if got:
                         break
-                    q = t[2:].strip()
-                    if q and q not in got:
-                        got.append(q)
-                return got
-            return None
-
-        chips = items_under(cls.NEXT_TITLE)
-        # The model sometimes moved the offers under "관련:" and left the list empty
-        # (159 10-23, 1022-final instructions); take them from there only then.
-        if chips == []:
-            chips = items_under("관련:") or []
-        chips = chips or []
-        tail = "\n".join(lines[-3:])
-        if cls._END_LINE.search(tail):
+                    continue
+                it = cls._ITEM.match(t)
+                if not it:
+                    break
+                listed.add(j)
+                if raw[:1] in (" ", "\t") and len(raw) - len(raw.lstrip()) >= 2 and got:
+                    continue  # a sub-item belongs to the line above, not a question of its own
+                q = it.group(1).strip().strip("`").strip()
+                q = re.sub(r"^\*\*(.*)\*\*$", r"\1", q).strip()
+                # A KB title with its Broadcom link is a reference, not a question to send back.
+                if q and "://" not in q and q not in got:
+                    got.append(q)
+            lists.setdefault(key, got)
+        chips = lists.get("next") or []
+        # The model sometimes put the offers under "관련:" instead (159 10-23, 1022-final
+        # instructions), with the "이어서" list empty or gone; take them from there then.
+        if not chips:
+            chips = lists.get("related") or []
+        # "문서의 끝입니다." anywhere outside the lists: a finished document has no "more".
+        rest = "\n".join(l for k, l in enumerate(lines) if k not in listed)
+        if cls._END_LINE.search(rest):
             chips = [c for c in chips if c != cls.MORE]
-        elif cls._MORE_LINE.search(answer or "") and cls.MORE not in chips[:1]:
+        elif cls._MORE_LINE.search(rest) and cls.MORE not in chips[:1]:
             chips = [cls.MORE] + [c for c in chips if c != cls.MORE]
         return chips[: max(0, limit)]
 
@@ -681,10 +694,12 @@ class Pipe:
                 t = cls._unwrap(t) if t else t
                 if t:
                     return t if len(t) <= 40 else t[:39].rstrip() + "…"
-        return "새 대화"
+        return ""
 
     def local_task(self, task: str, body: dict, __metadata__: dict = None) -> Optional[str]:
         """The JSON Open WebUI expects for its task, or None when the task is not ours."""
+        if not task:
+            return None
         import json
 
         meta = __metadata__ or {}
@@ -700,7 +715,13 @@ class Pipe:
         if task == "tags_generation":
             return json.dumps({"tags": []})
         if task == "query_generation":
-            return json.dumps({"queries": []})
+            # Web search skips an empty list; the user's own question is the best query.
+            last_q = ""
+            for m in reversed(chat or []):
+                if isinstance(m, dict) and m.get("role") == "user":
+                    last_q = " ".join(self._text_of(m.get("content")).split())
+                    break
+            return json.dumps({"queries": [last_q] if last_q else []}, ensure_ascii=False)
         if task == "emoji_generation":
             return ""
         if task == "autocomplete_generation":
@@ -723,8 +744,10 @@ class Pipe:
             meta = dict(__metadata__ or {})
             if __task_body__ and not meta.get("task_body"):
                 meta["task_body"] = __task_body__
-            done = self.local_task(self._task_of(__task__, meta), body, meta)
+            task = self._task_of(__task__, meta)
+            done = self.local_task(task, body, meta)
             if done is not None:
+                logger.info(f"pais pipe: Open WebUI task {task} answered locally ({len(done)} chars)")
                 return done
         target_id = body["model"][body["model"].find(".") + 1 :]
         target_assistant = self.get_assistant(target_id)

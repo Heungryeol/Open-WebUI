@@ -54,3 +54,8 @@ Open WebUI 는 답이 끝나면 제목·후속 질문 칩·태그를 만들려�
   - **작업 모델(Task Model, 외부)은 비워 두거나 이 파이프 모델로.** 다른 모델을 고르면 파이프를 거치지 않으므로,
     그때는 BRCM-MCP #64 의 Follow Up Generation Prompt 를 붙여 넣는다.
   - 제목 생성·태그 생성은 켜 두어도 된다(파이프가 PAIS 없이 답함).
+  - 사용자마다 설정 → 인터페이스 → **Follow-Up Auto-Generation**(기본 켬)도 켜져 있어야 칩이 보인다.
+- 동작 확인: Open WebUI 로그에 `pais pipe: Open WebUI task follow_up_generation answered locally` 가 찍힌다.
+  이 줄이 없으면 작업 모델이 다른 모델로 정해져 있는 것이다.
+- 칩은 서버의 `next` 가 아니라 **모델이 답에 옮겨 쓴 목록**이다. 모델이 문장을 바꿔 쓰면 칩도 그 문장이 된다.
+  URL 이 든 `관련:` 줄(KB 제목·링크)은 칩으로 만들지 않는다.

@@ -12,6 +12,7 @@ description: >
 requirements: httpx
 """
 
+import re
 import time
 import threading
 from typing import Optional, Union, Generator, Iterator
@@ -127,6 +128,18 @@ class Pipe:
         FOLLOWUP_MAX_CHARS: int = Field(
             default=25,
             description="이 글자 수 이하의 질문을 후속 질문으로 본다.",
+        )
+        # Open WebUI sends its own background tasks (chat title, follow-up chips, tags)
+        # to the chat's model when no task model is set -- here that is the PAIS agent,
+        # which then called tools for prompts nobody typed ("현재 발생 중인 주요 장애 …",
+        # 159 10-23 00:51) and wrote chips unlike the answer's own list (BRCM-MCP #64).
+        # The pipe answers those tasks itself, without PAIS.
+        LOCAL_TASKS: bool = Field(
+            default=True,
+            description="Open WebUI 작업(제목·후속 질문 칩·태그 등)은 PAIS 를 부르지 않고 파이프가 직접 답함. 칩 = 마지막 답의 '이어서 물어볼 만한 것:' 줄 그대로.",
+        )
+        FOLLOWUP_MAX_CHIPS: int = Field(
+            default=5, description="후속 질문 칩 최대 개수."
         )
         FORCE_TOOL_CHOICE: bool = Field(
             default=False,
@@ -589,13 +602,130 @@ class Pipe:
     # ------------------------------------------------------------------
     # Chat Completion 호출
     # ------------------------------------------------------------------
+    # ---- Open WebUI background tasks (BRCM-MCP #64) ----
+    NEXT_TITLE = "이어서 물어볼 만한 것:"
+    MORE = "나머지 보여줘"
+    _MORE_LINE = re.compile(r"이어서\s*보려면\s*'나머지 보여줘'|'나머지 보여줘'\s*로")
+    _END_LINE = re.compile(r"문서의\s*끝입니다")
+
+    @staticmethod
+    def _task_of(__task__, __metadata__) -> str:
+        task = __task__ or (__metadata__ or {}).get("task") or ""
+        return str(task).split(".")[-1].lower()
+
+    @classmethod
+    def _last_answer(cls, messages: list) -> str:
+        for m in reversed(messages or []):
+            if isinstance(m, dict) and m.get("role") == "assistant":
+                text = cls._text_of(m.get("content"))
+                if text.strip():
+                    return text
+        return ""
+
+    @classmethod
+    def _history_answer(cls, prompt: str) -> str:
+        """The last ASSISTANT turn inside the task prompt's <chat_history>, for an
+        Open WebUI that does not pass the chat itself in the task body."""
+        m = re.search(r"<chat_history>(.*?)</chat_history>", prompt or "", re.S)
+        hist = m.group(1) if m else (prompt or "")
+        parts = re.split(r"(?im)^\s*(USER|ASSISTANT)\s*:", hist)
+        last = ""
+        for i in range(1, len(parts) - 1, 2):
+            if parts[i].upper() == "ASSISTANT":
+                last = parts[i + 1]
+        return last
+
+    @classmethod
+    def follow_up_chips(cls, answer: str, limit: int = 5) -> list:
+        """Chips are the answer's own list, copied: a chip is sent back word for word,
+        so only sentences the server offered route and page correctly (#64)."""
+        lines = (answer or "").splitlines()
+
+        def items_under(title: str) -> Optional[list]:
+            for i, line in enumerate(lines):
+                if line.strip().strip("*").strip() != title:
+                    continue
+                got = []
+                for nxt in lines[i + 1:]:
+                    t = nxt.strip()
+                    if not t:
+                        if got:
+                            break
+                        continue
+                    if not t.startswith(("- ", "* ")):
+                        break
+                    q = t[2:].strip()
+                    if q and q not in got:
+                        got.append(q)
+                return got
+            return None
+
+        chips = items_under(cls.NEXT_TITLE)
+        # The model sometimes moved the offers under "관련:" and left the list empty
+        # (159 10-23, 1022-final instructions); take them from there only then.
+        if chips == []:
+            chips = items_under("관련:") or []
+        chips = chips or []
+        tail = "\n".join(lines[-3:])
+        if cls._END_LINE.search(tail):
+            chips = [c for c in chips if c != cls.MORE]
+        elif cls._MORE_LINE.search(answer or "") and cls.MORE not in chips[:1]:
+            chips = [cls.MORE] + [c for c in chips if c != cls.MORE]
+        return chips[: max(0, limit)]
+
+    @classmethod
+    def chat_title(cls, messages: list) -> str:
+        for m in messages or []:
+            if isinstance(m, dict) and m.get("role") == "user":
+                t = " ".join(cls._text_of(m.get("content")).split())
+                t = cls._unwrap(t) if t else t
+                if t:
+                    return t if len(t) <= 40 else t[:39].rstrip() + "…"
+        return "새 대화"
+
+    def local_task(self, task: str, body: dict, __metadata__: dict = None) -> Optional[str]:
+        """The JSON Open WebUI expects for its task, or None when the task is not ours."""
+        import json
+
+        meta = __metadata__ or {}
+        tbody = meta.get("task_body") or body.get("metadata", {}).get("task_body") or {}
+        chat = tbody.get("messages") if isinstance(tbody, dict) else None
+        prompt = self._text_of((body.get("messages") or [{}])[-1].get("content")) if body.get("messages") else ""
+        if task in ("follow_up_generation", "follow_ups_generation"):
+            answer = self._last_answer(chat) if chat else self._history_answer(prompt)
+            return json.dumps({"follow_ups": self.follow_up_chips(answer, self.valves.FOLLOWUP_MAX_CHIPS)},
+                              ensure_ascii=False)
+        if task == "title_generation":
+            return json.dumps({"title": self.chat_title(chat or [])}, ensure_ascii=False)
+        if task == "tags_generation":
+            return json.dumps({"tags": []})
+        if task == "query_generation":
+            return json.dumps({"queries": []})
+        if task == "emoji_generation":
+            return ""
+        if task == "autocomplete_generation":
+            return json.dumps({"text": ""})
+        if task:
+            # Any other Open WebUI task: still nothing for the agent to do with tools.
+            return "{}"
+        return None
+
     def pipe(
         self,
         body: dict,
         __user__: Optional[dict] = None,
         __metadata__: dict = None,
         __event_emitter__=None,
+        __task__=None,
+        __task_body__=None,
     ) -> Union[str, Generator, Iterator]:
+        if self.valves.LOCAL_TASKS:
+            meta = dict(__metadata__ or {})
+            if __task_body__ and not meta.get("task_body"):
+                meta["task_body"] = __task_body__
+            done = self.local_task(self._task_of(__task__, meta), body, meta)
+            if done is not None:
+                return done
         target_id = body["model"][body["model"].find(".") + 1 :]
         target_assistant = self.get_assistant(target_id)
 

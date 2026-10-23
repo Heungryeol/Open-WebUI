@@ -621,10 +621,33 @@ class Pipe:
         return str(task).split(".")[-1].lower()
 
     @classmethod
+    def _output_text(cls, item) -> str:
+        """Text of Open WebUI 0.10+ `output` items: an answer can be saved there with
+        `content` left empty (lab 2026-10-15; 159 chats read back empty 10-24)."""
+        if isinstance(item, str):
+            return item
+        if isinstance(item, list):
+            return "\n".join(t for t in (cls._output_text(x) for x in item) if t and t.strip())
+        if not isinstance(item, dict):
+            return ""
+        kind = str(item.get("type") or "")
+        if kind in ("function_call_output", "tool_result", "tool_call_output", "reasoning", "web_search_call") \
+                or "call" in kind:
+            return ""
+        if isinstance(item.get("text"), str):
+            return item["text"]
+        for key in ("content", "output", "message"):
+            if key in item:
+                return cls._output_text(item[key])
+        return ""
+
+    @classmethod
     def _last_answer(cls, messages: list) -> str:
         for m in reversed(messages or []):
             if isinstance(m, dict) and m.get("role") == "assistant":
                 text = cls._text_of(m.get("content"))
+                if not text.strip():
+                    text = cls._output_text(m.get("output"))
                 if text.strip():
                     return text
         return ""

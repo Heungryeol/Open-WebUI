@@ -967,9 +967,14 @@ class Pipe:
                 if tail:
                     yield tail
                 self._remember(hide, filt.items)
+                filt = None  # remembered; the finally below must not forget it
 
         except Exception as e:
             logger.error(f"스트리밍 처리 중 오류: {e}")
             yield f"\n\nError during streaming: {str(e)}"
         finally:
+            # A stream that broke off or was cancelled: forget the chat's earlier list,
+            # or the chips of the answer before would show under this one.
+            if filt is not None and hide:
+                self._next_lists.pop(hide, None)
             response.close()

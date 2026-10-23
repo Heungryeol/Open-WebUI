@@ -138,6 +138,14 @@ class Pipe:
             default=True,
             description="Open WebUI 작업(제목·후속 질문 칩·태그 등)은 PAIS 를 부르지 않고 파이프가 직접 답함. 칩 = 마지막 답의 '이어서 물어볼 만한 것:' 줄 그대로.",
         )
+        # The server's next questions are shown twice when chips are on: as the
+        # "이어서 물어볼 만한 것:" list in the answer and as chips under it (159 10-24).
+        # The pipe keeps the list out of the answer it hands Open WebUI and
+        # remembers it per chat for the chips. The agent still writes the list.
+        HIDE_NEXT_LIST: bool = Field(
+            default=True,
+            description="답 본문의 '이어서 물어볼 만한 것:' 목록은 숨기고 후속 질문 칩으로만 보임(LOCAL_TASKS 와 함께).",
+        )
         FOLLOWUP_MAX_CHIPS: int = Field(
             default=5, description="후속 질문 칩 최대 개수."
         )
@@ -155,6 +163,8 @@ class Pipe:
         self._access_token: Optional[str] = None
         self._token_expires_at: float = 0.0
         self._token_lock = threading.Lock()
+        # chat_id -> the "이어서 물어볼 만한 것:" lines last hidden from that chat's answer.
+        self._next_lists: dict = {}
         # 요청마다 새 TCP/TLS 커넥션을 맺지 않도록, Pipe 인스턴스 생명주기 동안
         # 재사용하는 단일 httpx.Client. (Open WebUI <-> PAIS 구간 지연의 상당수는
         # 매 메시지마다 새 클라이언트를 생성/종료하며 발생하는 handshake 비용이었음)
@@ -719,6 +729,76 @@ class Pipe:
                     return t if len(t) <= 40 else t[:39].rstrip() + "…"
         return ""
 
+    class _NextListFilter:
+        """Drops the "이어서 물어볼 만한 것:" heading and its "- " lines from streamed
+        text, line by line, and keeps the lines it dropped (HIDE_NEXT_LIST)."""
+
+        def __init__(self, head_re, item_re):
+            self.head_re, self.item_re = head_re, item_re
+            self.pending, self.state, self.items, self.held = "", "text", [], ""
+
+        def _line(self, line: str) -> str:
+            bare = line.rstrip("\r")
+            if self.state == "text":
+                h = self.head_re.match(bare)
+                if h and h.group(1).startswith("이어서"):
+                    self.state, self.held = "list", ""
+                    return ""
+                return line + "\n"
+            # in the list: blank lines before or between items are held, items are dropped
+            t = bare.strip()
+            if not t:
+                self.held += line + "\n"
+                if self.items:
+                    self.state = "text"
+                    out, self.held = self.held, ""
+                    return out
+                return ""
+            it = self.item_re.match(t)
+            if it:
+                self.items.append(t)
+                self.held = ""
+                return ""
+            self.state = "text"
+            out, self.held = self.held + line + "\n", ""
+            return out
+
+        def feed(self, chunk: str) -> str:
+            self.pending += chunk
+            out = []
+            while "\n" in self.pending:
+                line, self.pending = self.pending.split("\n", 1)
+                out.append(self._line(line))
+            return "".join(out)
+
+        def flush(self) -> str:
+            rest, self.pending = self.pending, ""
+            if not rest:
+                return ""
+            return self._line(rest).rstrip("\n")
+
+    def _hiding(self, meta: dict) -> Optional[str]:
+        """The chat id to remember a hidden list under, or None when lists stay."""
+        if not (self.valves.HIDE_NEXT_LIST and self.valves.LOCAL_TASKS):
+            return None
+        return str((meta or {}).get("chat_id") or "") or None
+
+    def _remember(self, chat_id: str, items: list) -> None:
+        if items:
+            self._next_lists[chat_id] = items
+        else:
+            self._next_lists.pop(chat_id, None)
+        while len(self._next_lists) > 500:  # bounded: oldest chats first
+            self._next_lists.pop(next(iter(self._next_lists)))
+
+    def strip_next_list(self, text: str, chat_id: Optional[str]) -> str:
+        if not chat_id or not text:
+            return text
+        f = self._NextListFilter(self._HEAD, self._ITEM)
+        out = f.feed(text) + f.flush()
+        self._remember(chat_id, f.items)
+        return out.rstrip() + ("\n" if text.endswith("\n") else "")
+
     def local_task(self, task: str, body: dict, __metadata__: dict = None) -> Optional[str]:
         """The JSON Open WebUI expects for its task, or None when the task is not ours."""
         if not task:
@@ -731,6 +811,10 @@ class Pipe:
         prompt = self._text_of((body.get("messages") or [{}])[-1].get("content")) if body.get("messages") else ""
         if task in ("follow_up_generation", "follow_ups_generation"):
             answer = self._last_answer(chat) if chat else self._history_answer(prompt)
+            cid = str(meta.get("chat_id") or (tbody.get("chat_id") if isinstance(tbody, dict) else "") or "")
+            hidden = self._next_lists.get(cid) if cid else None
+            if hidden and not any(self._HEAD.match(l) for l in answer.splitlines()):
+                answer = answer.rstrip() + "\n\n" + self.NEXT_TITLE + "\n" + "\n".join(hidden)
             return json.dumps({"follow_ups": self.follow_up_chips(answer, self.valves.FOLLOWUP_MAX_CHIPS)},
                               ensure_ascii=False)
         if task == "title_generation":
@@ -823,12 +907,13 @@ class Pipe:
                 response.close()
                 return f"Error: PAIS 응답 오류 (Status {response.status_code}): {body_text[:1000]}"
 
+            hide = self._hiding(__metadata__)
             if payload["stream"]:
-                return self.stream_generator(response, __event_emitter__)
+                return self.stream_generator(response, __event_emitter__, hide)
             else:
                 data = response.json()
                 response.close()
-                return data["choices"][0]["message"]["content"]
+                return self.strip_next_list(data["choices"][0]["message"]["content"], hide)
 
         except httpx.TimeoutException as e:
             return (
@@ -841,12 +926,13 @@ class Pipe:
             logger.error(f"예상치 못한 오류: {e}")
             return f"Error: 예상치 못한 오류가 발생했습니다: {str(e)}"
 
-    def stream_generator(self, response, __event_emitter__=None):
+    def stream_generator(self, response, __event_emitter__=None, hide: Optional[str] = None):
         """SSE(data: {...}) 스트림을 파싱해서 delta content만 순차적으로 yield한다.
         공용 persistent client는 여기서 닫지 않고 response만 닫아 커넥션(keep-alive)을
         다음 요청에서도 재사용할 수 있게 한다."""
         import json
 
+        filt = self._NextListFilter(self._HEAD, self._ITEM) if hide else None
         try:
             for line in response.iter_lines():
                 if not line:
@@ -871,7 +957,16 @@ class Pipe:
                 delta = choices[0].get("delta", {})
                 content = delta.get("content")
                 if content:
-                    yield content
+                    if filt is not None:
+                        content = filt.feed(content)
+                    if content:
+                        yield content
+
+            if filt is not None:
+                tail = filt.flush()
+                if tail:
+                    yield tail
+                self._remember(hide, filt.items)
 
         except Exception as e:
             logger.error(f"스트리밍 처리 중 오류: {e}")

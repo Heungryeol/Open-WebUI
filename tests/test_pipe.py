@@ -54,6 +54,20 @@ class TestChips(unittest.TestCase):
         self.assertEqual(P.follow_up_chips("관련:\n- X (https://knowledge.broadcom.com/x)\n- KB 1 요약해줘"),
                          ["KB 1 요약해줘"])
 
+    def test_the_models_own_quoted_offers_become_chips_when_there_is_no_list(self):
+        # 159 10-30: the kr-ops 3-month onset answer ended with the model's own heading and
+        # quoted questions with a gloss -- no "이어서" list, so no chips at all.
+        a = ("kr-ops 의 다음 변화 시점은 ...\n\n| 지표 | 시점 |\n|---|---|\n| CPU | 09-29 |\n\n"
+             "**분석 요약:**\n9월 29일 ...\n\n추가로 확인이 필요한 사항이 있다면 말씀해 주세요:\n"
+             "* \"다음 변화점 보여줘\" (남은 변화점 확인)\n"
+             "* \"kr-ops 느려진 원인 분석\" (로그 및 알람 기반 원인 분석)\n"
+             "* \"kr-ops 09-29 14:59 원인 분석\" (가장 큰 변화가 있었던 CPU 급증 시점 집중 분석)\n")
+        self.assertEqual(P.follow_up_chips(a), ["다음 변화점 보여줘", "kr-ops 느려진 원인 분석", "kr-ops 09-29 14:59 원인 분석"])
+        # The server's list still wins when both are there, and a quoted item inside a table is not read.
+        both = a + "\n이어서 물어볼 만한 것:\n- 나머지 보여줘\n"
+        self.assertEqual(P.follow_up_chips(both), ["나머지 보여줘"])
+        self.assertEqual(P.follow_up_chips("표\n- \"a\" (x)\n\n끝 문장입니다."), [])
+
     def test_zero_left_is_not_more(self):
         self.assertEqual(P.follow_up_chips("나머지 0개는 '나머지 보여줘' 로.\n\n이어서 물어볼 만한 것:\n- a"), ["a"])
 

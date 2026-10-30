@@ -624,6 +624,10 @@ class Pipe:
     # Heading variants seen from models: bold, "###", no colon, full-width colon.
     _HEAD = re.compile(r"^\s*(?:#+\s*)?\**\s*(이어서\s*물어볼\s*만한\s*것|관련)\s*\**\s*[:：]?\s*\**\s*$")
     _ITEM = re.compile(r"^(?:[-*•]|\d+[.)])\s+(.*)$")
+    # The model's own offer list under another heading ("추가로 확인이 필요한 사항이 있다면 말씀해
+    # 주세요:") with each item a quoted question and a gloss: '"다음 변화점 보여줘" (남은 변화점 확인)'
+    # (159, kr-ops 3-month onset chat, 2026-10-30). The quoted sentence is the chip; the gloss is not.
+    _QUOTED_ITEM = re.compile(r"^(?:[-*•]|\d+[.)])\s+\**\s*[\"“‘']([^\"”’']{2,80})[\"”’']\**\s*(?:[(（][^)）]*[)）])?\s*\.?\s*$")
 
     @staticmethod
     def _task_of(__task__, __metadata__) -> str:
@@ -711,6 +715,8 @@ class Pipe:
         # instructions), with the "이어서" list empty or gone; take them from there then.
         if not chips:
             chips = lists.get("related") or []
+        if not chips:
+            chips = cls._quoted_offers(lines, listed)
         # "문서의 끝입니다." anywhere outside the lists: a finished document has no "more".
         rest = "\n".join(l for k, l in enumerate(lines) if k not in listed)
         if cls._END_LINE.search(rest):
@@ -718,6 +724,30 @@ class Pipe:
         elif cls._MORE_LINE.search(rest) and cls.MORE not in chips[:1]:
             chips = [cls.MORE] + [c for c in chips if c != cls.MORE]
         return chips[: max(0, limit)]
+
+    @classmethod
+    def _quoted_offers(cls, lines: list, listed: set) -> list:
+        """The last run of quoted-question items in the answer, whatever heading the model gave it;
+        a line of plain text in between ends the run, so an earlier table or list is not read."""
+        got = []
+        for raw in reversed(lines):
+            t = raw.strip()
+            if not t:
+                if got:
+                    break
+                continue
+            it = cls._QUOTED_ITEM.match(t)
+            if it:
+                q = it.group(1).strip()
+                if q and "://" not in q and q not in got:
+                    got.insert(0, q)
+                continue
+            if got:
+                break
+            if cls._ITEM.match(t):
+                continue        # a trailing unquoted item (a gloss line) above the quoted ones
+            break
+        return got
 
     @classmethod
     def chat_title(cls, messages: list) -> str:

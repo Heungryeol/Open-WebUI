@@ -10,6 +10,8 @@ Authentik OAuth2 password grant 로 토큰을 받는다.
 ### 적용
 
 1. Open WebUI 관리자 → Functions → PAIS Multi Agent Pipe → 코드를 이 파일로 바꾸고 저장.
+   또는 API 로: `OPENWEBUI_URL=https://<open webui> OPENWEBUI_KEY=<관리자 API 키> python3 scripts/update_function.py --insecure`
+   (현재 함수의 이름·meta 는 두고 `content` 만 이 파일로 바꾼다).
 2. **Valves 에서 `Oidc Client Id` 와 `Oidc Password` 를 넣는다.** 이 저장소는 공개라 두 값을 코드에 두지 않는다.
    코드를 바꿔 저장하면 Valves 가 빈 기본값으로 돌아갈 수 있다(2026-10-22, Valve 를 더한 판에서 실제로 비워짐 →
    `invalid_client`). **코드를 바꾼 뒤에는 항상 Valves 의 Client Id·Password 를 다시 확인한다.**

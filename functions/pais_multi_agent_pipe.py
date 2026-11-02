@@ -627,7 +627,9 @@ class Pipe:
     # The model's own offer list under another heading ("추가로 확인이 필요한 사항이 있다면 말씀해
     # 주세요:") with each item a quoted question and a gloss: '"다음 변화점 보여줘" (남은 변화점 확인)'
     # (159, kr-ops 3-month onset chat, 2026-10-30). The quoted sentence is the chip; the gloss is not.
-    _QUOTED_ITEM = re.compile(r"^(?:[-*•]|\d+[.)])\s+\**\s*[\"“‘']([^\"”’']{2,80})[\"”’']\**\s*(?:[(（][^)）]*[)）])?\s*\.?\s*$")
+    # Backticks too: on 11-02 the model wrote "* `sc-nfs01-ds 왜 문제야?` (스토리지 이슈 원인 분석)", which
+    # Open WebUI showed as copyable code and no chips.
+    _QUOTED_ITEM = re.compile(r"^(?:[-*•]|\d+[.)])\s+\**\s*[\"“‘'`]([^\"”’'`]{2,80})[\"”’'`]\**\s*(?:[(（][^)）]*[)）])?\s*\.?\s*$")
 
     @staticmethod
     def _task_of(__task__, __metadata__) -> str:

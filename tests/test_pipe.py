@@ -62,7 +62,9 @@ class TestChips(unittest.TestCase):
              "* \"다음 변화점 보여줘\" (남은 변화점 확인)\n"
              "* \"kr-ops 느려진 원인 분석\" (로그 및 알람 기반 원인 분석)\n"
              "* \"kr-ops 09-29 14:59 원인 분석\" (가장 큰 변화가 있었던 CPU 급증 시점 집중 분석)\n")
-        self.assertEqual(P.follow_up_chips(a), ["다음 변화점 보여줘", "kr-ops 느려진 원인 분석", "kr-ops 09-29 14:59 원인 분석"])
+        # The gloss stays on the chip (admin, 11-02); the pipe strips it again when the chip comes back.
+        self.assertEqual(P.follow_up_chips(a), ["다음 변화점 보여줘 (남은 변화점 확인)", "kr-ops 느려진 원인 분석 (로그 및 알람 기반 원인 분석)",
+                                                "kr-ops 09-29 14:59 원인 분석 (가장 큰 변화가 있었던 CPU 급증 시점 집중 분석)"])
         # The server's list still wins when both are there, and a quoted item inside a table is not read.
         both = a + "\n이어서 물어볼 만한 것:\n- 나머지 보여줘\n"
         self.assertEqual(P.follow_up_chips(both), ["나머지 보여줘"])
@@ -70,7 +72,40 @@ class TestChips(unittest.TestCase):
         # 11-02: backticked items under the model's own heading, with and without a gloss.
         b = ("...\n\n**다음 단계로 무엇을 도와드릴까요?**\n* `sc-nfs01-ds 왜 문제야?` (스토리지 이슈 원인 분석)\n"
              "* `kr-mgmt-cl01 왜 문제야?` (네트워크 이슈 원인 분석)\n* `나머지 보여줘`\n")
-        self.assertEqual(P.follow_up_chips(b), ["sc-nfs01-ds 왜 문제야?", "kr-mgmt-cl01 왜 문제야?", "나머지 보여줘"])
+        self.assertEqual(P.follow_up_chips(b), ["sc-nfs01-ds 왜 문제야? (스토리지 이슈 원인 분석)", "kr-mgmt-cl01 왜 문제야? (네트워크 이슈 원인 분석)",
+                                                "나머지 보여줘"])
+
+    def test_the_models_own_offer_list_is_hidden_from_the_body_and_the_chip_comes_back_bare(self):
+        # 11-02 12:57: the list under "다음 단계로 무엇을 도와드릴까요?" showed in the answer AND as chips,
+        # and a clicked chip arrived as '"sc-nfs01-ds 왜 문제야?" (스토리지 이슈 원인 분석)'.
+        p = P()
+        body = ("요약입니다.\n\n---\n**다음 단계로 무엇을 도와드릴까요?**\n* `sc-nfs01-ds 왜 문제야?` (스토리지 이슈 원인 분석)\n"
+                "* \"나머지 보여줘\" (진행 중인 WARNING 알람 확인)\n")
+        shown = p.strip_next_list(body, "c9")
+        self.assertNotIn("다음 단계로", shown)
+        self.assertNotIn("sc-nfs01-ds 왜 문제야", shown)
+        self.assertTrue(shown.rstrip().endswith("---"))
+        chat = [{"role": "user", "content": "q"}, {"role": "assistant", "content": shown}]
+        out = p.pipe({"model": "x", "messages": [{"role": "user", "content": "t"}]},
+                     __metadata__={"task": "follow_up_generation", "chat_id": "c9", "task_body": {"messages": chat, "chat_id": "c9"}})
+        self.assertEqual(json.loads(out)["follow_ups"], ["sc-nfs01-ds 왜 문제야? (스토리지 이슈 원인 분석)", "나머지 보여줘 (진행 중인 WARNING 알람 확인)"])
+        # The chip comes back: its gloss goes, so the server sees the bare sentence; so does the quoted form.
+        self.assertEqual(p._unwrap_chip("sc-nfs01-ds 왜 문제야? (스토리지 이슈 원인 분석)"), "sc-nfs01-ds 왜 문제야?")
+        self.assertEqual(p._unwrap_chip('"sc-nfs01-ds 왜 문제야?" (스토리지 이슈 원인 분석)'), "sc-nfs01-ds 왜 문제야?")
+        # A typed question with its own parenthesis is not a chip and stays whole.
+        self.assertEqual(p._unwrap_chip("CPU 사용률 (지난 7일) 보여줘"), "CPU 사용률 (지난 7일) 보여줘")
+        # A heading followed by ordinary text is not an offer list: nothing hidden.
+        kept = p.strip_next_list("답.\n\n**확인이 필요한 사항:**\n네트워크를 점검하세요.\n", "c10")
+        self.assertIn("확인이 필요한 사항", kept)
+        self.assertIn("네트워크를 점검하세요", kept)
+
+    def test_the_offer_list_is_hidden_from_a_stream_too(self):
+        p = P()
+        text = "답.\n\n**추천 질문:**\n* `esx09 알림 보여줘` (경고 확인)\n* `esx09 변화 시점 그래프 보여줘`"
+        out = "".join(p.stream_generator(Stream(text), None, "c11"))
+        self.assertEqual(out.strip(), "답.")
+        self.assertEqual(p.follow_up_chips("x\n\n이어서 물어볼 만한 것:\n" + "\n".join(p._next_lists["c11"])),
+                         ["esx09 알림 보여줘 (경고 확인)", "esx09 변화 시점 그래프 보여줘"])
 
     def test_zero_left_is_not_more(self):
         self.assertEqual(P.follow_up_chips("나머지 0개는 '나머지 보여줘' 로.\n\n이어서 물어볼 만한 것:\n- a"), ["a"])

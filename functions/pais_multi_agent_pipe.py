@@ -405,6 +405,20 @@ class Pipe:
                         and re.search(cls._ASKS, inner, re.I)):
                     return inner.strip()
         return t
+    def _unwrap_chip(self, bare: str) -> str:
+        """A whole-message wrapper (_unwrap), then a chip's quotes and gloss (_bare_chip): the gloss
+        is dropped only for a chip this pipe offered to the chat, or a quoted sentence with a gloss."""
+        inner = self._unwrap(bare)
+        if inner != bare:
+            return inner
+        if self._QUOTED_CHIP.match(bare):
+            return self._bare_chip(bare)
+        g = self._CHIP_GLOSS.match(bare)
+        if g and any(bare.strip() == c for items in self._next_lists.values()
+                     for c in (self._chip_text(self._ITEM.match(i).group(1)) for i in items if self._ITEM.match(i))):
+            return g.group(1).strip()
+        return bare
+
     # A typed question number, either case: "Q4 ...", "q1. ...".
     _QLABEL = r"^\s*[Qq]\d+[.):]?\s*"
     # "나머지 보여줘" and its variants; a sentence with more in it is a new question.
@@ -516,7 +530,7 @@ class Pipe:
         # Spell out the call it should make; the server keeps the page.
         cur_text = self._text_of(current.get("content")).strip()
         bare = re.sub(self._QLABEL, "", cur_text)
-        unwrapped = self._unwrap(bare)
+        unwrapped = self._unwrap_chip(bare)
         if unwrapped != bare:
             cur_text = cur_text[: len(cur_text) - len(bare)] + unwrapped
             bare = unwrapped
@@ -629,7 +643,38 @@ class Pipe:
     # (159, kr-ops 3-month onset chat, 2026-10-30). The quoted sentence is the chip; the gloss is not.
     # Backticks too: on 11-02 the model wrote "* `sc-nfs01-ds 왜 문제야?` (스토리지 이슈 원인 분석)", which
     # Open WebUI showed as copyable code and no chips.
-    _QUOTED_ITEM = re.compile(r"^(?:[-*•]|\d+[.)])\s+\**\s*[\"“‘'`]([^\"”’'`]{2,80})[\"”’'`]\**\s*(?:[(（][^)）]*[)）])?\s*\.?\s*$")
+    _QUOTED_ITEM = re.compile(r"^(?:[-*•]|\d+[.)])\s+\**\s*[\"“‘'`]([^\"”’'`]{2,80})[\"”’'`]\**\s*([(（][^)）]*[)）])?\s*\.?\s*$")
+    # A chip keeps the model's gloss ("sc-nfs01-ds 왜 문제야? (스토리지 이슈 원인 분석)", admin 11-02) and the
+    # pipe takes it off again when the chip comes back as the next question (_unwrap), so the server
+    # sees the bare sentence -- the quoted form sent as typed went to a log search (159 11-02 12:57).
+    _CHIP_GLOSS = re.compile(r"^(.*?\S)\s+([(（][^)）]*[)）])$")
+    _QUOTED_CHIP = re.compile(r"^[\"“‘'`]([^\"”’'`]{2,80})[\"”’'`]\s*(?:[(（][^)）]*[)）])?\s*\.?$")
+    # The model's own offer heading before a run of quoted items: short, ends with ":" or "?", and names
+    # questions or next steps. Held until the next line says whether a quoted list follows.
+    _OFFER_HEAD = re.compile(r"^\s*(?:#+\s*)?\**\s*[^|]{2,60}?(?:질문|도와드릴|다음\s*단계|이어서|추천|확인|문의|물어|궁금)[^|]{0,30}?[:：?？]\s*\**\s*$")
+
+    @classmethod
+    def _chip_text(cls, item: str) -> str:
+        """The chip for one list item: a quoted question keeps its gloss, the quotes go."""
+        q = (item or "").strip()
+        q = re.sub(r"^\*\*(.*)\*\*$", r"\1", q).strip()
+        m = cls._QUOTED_CHIP.match(q)
+        if m:
+            inner = m.group(1).strip()
+            g = cls._CHIP_GLOSS.match(q.rstrip("."))
+            gloss = g.group(2) if g else ""
+            return f"{inner} {gloss}".strip() if gloss else inner
+        return q.strip("`").strip()
+
+    @classmethod
+    def _bare_chip(cls, text: str) -> str:
+        """The question a chip stands for: quotes and the trailing gloss removed. Only a whole message
+        that is a quoted sentence, or a sentence plus one gloss the pipe itself attached, is touched."""
+        t = (text or "").strip()
+        m = cls._QUOTED_CHIP.match(t)
+        if m:
+            return m.group(1).strip()
+        return t
 
     @staticmethod
     def _task_of(__task__, __metadata__) -> str:
@@ -706,8 +751,7 @@ class Pipe:
                 listed.add(j)
                 if raw[:1] in (" ", "\t") and len(raw) - len(raw.lstrip()) >= 2 and got:
                     continue  # a sub-item belongs to the line above, not a question of its own
-                q = it.group(1).strip().strip("`").strip()
-                q = re.sub(r"^\*\*(.*)\*\*$", r"\1", q).strip()
+                q = cls._chip_text(it.group(1))
                 # A KB title with its Broadcom link is a reference, not a question to send back.
                 if q and "://" not in q and q not in got:
                     got.append(q)
@@ -721,10 +765,15 @@ class Pipe:
             chips = cls._quoted_offers(lines, listed)
         # "문서의 끝입니다." anywhere outside the lists: a finished document has no "more".
         rest = "\n".join(l for k, l in enumerate(lines) if k not in listed)
+
+        def bare(c: str) -> str:            # "나머지 보여줘 (설명)" is the paging chip too
+            g = cls._CHIP_GLOSS.match(c)
+            return g.group(1).strip() if g else c
+
         if cls._END_LINE.search(rest):
-            chips = [c for c in chips if c != cls.MORE]
-        elif cls._MORE_LINE.search(rest) and cls.MORE not in chips[:1]:
-            chips = [cls.MORE] + [c for c in chips if c != cls.MORE]
+            chips = [c for c in chips if bare(c) != cls.MORE]
+        elif cls._MORE_LINE.search(rest) and (not chips or bare(chips[0]) != cls.MORE):
+            chips = [cls.MORE] + [c for c in chips if bare(c) != cls.MORE]
         return chips[: max(0, limit)]
 
     @classmethod
@@ -741,6 +790,8 @@ class Pipe:
             it = cls._QUOTED_ITEM.match(t)
             if it:
                 q = it.group(1).strip()
+                if it.group(2):
+                    q = f"{q} {it.group(2)}"
                 if q and "://" not in q and q not in got:
                     got.insert(0, q)
                 continue
@@ -765,9 +816,15 @@ class Pipe:
         """Drops the "이어서 물어볼 만한 것:" heading and its "- " lines from streamed
         text, line by line, and keeps the lines it dropped (HIDE_NEXT_LIST)."""
 
-        def __init__(self, head_re, item_re):
+        def __init__(self, head_re, item_re, offer_head_re=None, quoted_re=None):
             self.head_re, self.item_re = head_re, item_re
+            self.offer_head_re, self.quoted_re = offer_head_re, quoted_re
             self.pending, self.state, self.items, self.held = "", "text", [], ""
+            # The model's own offer list ("다음 단계로 무엇을 도와드릴까요?" + quoted items, 11-02): held
+            # from its heading on, dropped at the end of the answer when quoted items followed, shown
+            # again as soon as ordinary text follows instead. Only at the END of the answer: an earlier
+            # list the text goes on after is not the offers.
+            self.offer_held, self.offer_items = "", []
 
         def _line(self, line: str) -> str:
             bare = line.rstrip("\r")
@@ -776,7 +833,23 @@ class Pipe:
                 if h and h.group(1).startswith("이어서"):
                     self.state, self.held = "list", ""
                     return ""
+                if self.offer_head_re is not None and self.offer_head_re.match(bare):
+                    self.state, self.offer_held, self.offer_items = "offer", line + "\n", []
+                    return ""
                 return line + "\n"
+            if self.state == "offer":
+                t = bare.strip()
+                if not t:
+                    self.offer_held += line + "\n"
+                    return ""
+                if self.quoted_re is not None and self.quoted_re.match(t):
+                    self.offer_items.append(t)
+                    self.offer_held += line + "\n"
+                    return ""
+                # Ordinary text after the heading: not the offers, show what was held.
+                self.state = "text"
+                out, self.offer_held, self.offer_items = self.offer_held + line + "\n", "", []
+                return out
             # in the list: blank lines before or between items are held, items are dropped
             t = bare.strip()
             if not t:
@@ -805,9 +878,15 @@ class Pipe:
 
         def flush(self) -> str:
             rest, self.pending = self.pending, ""
-            if not rest:
-                return ""
-            return self._line(rest).rstrip("\n")
+            out = self._line(rest) if rest else ""
+            if self.state == "offer":
+                if self.offer_items:
+                    # The answer ended on the model's offer list: it becomes the chips (as "- " items).
+                    self.items = self.items or [f"- {t.lstrip('-*• ').lstrip('0123456789.) ')}" for t in self.offer_items]
+                    self.state, self.offer_held = "text", ""
+                else:
+                    out, self.offer_held = out + self.offer_held, ""
+            return out.rstrip("\n")
 
     def _hiding(self, meta: dict) -> Optional[str]:
         """The chat id to remember a hidden list under, or None when lists stay."""
@@ -826,7 +905,7 @@ class Pipe:
     def strip_next_list(self, text: str, chat_id: Optional[str]) -> str:
         if not chat_id or not text:
             return text
-        f = self._NextListFilter(self._HEAD, self._ITEM)
+        f = self._NextListFilter(self._HEAD, self._ITEM, self._OFFER_HEAD, self._QUOTED_ITEM)
         out = f.feed(text) + f.flush()
         self._remember(chat_id, f.items)
         return out.rstrip() + ("\n" if text.endswith("\n") else "")
@@ -964,7 +1043,7 @@ class Pipe:
         다음 요청에서도 재사용할 수 있게 한다."""
         import json
 
-        filt = self._NextListFilter(self._HEAD, self._ITEM) if hide else None
+        filt = self._NextListFilter(self._HEAD, self._ITEM, self._OFFER_HEAD, self._QUOTED_ITEM) if hide else None
         try:
             for line in response.iter_lines():
                 if not line:

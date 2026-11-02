@@ -632,11 +632,15 @@ class Pipe:
     # "이어서 보려면 '나머지 보여줘'" / "나머지 44건은 '나머지 보여줘' 로" in any quote style,
     # but not "나머지 0개는 …" (a real misprint, vcenter tools.py 2026-10-16).
     _Q = r"['\"‘’“”`]?"
+    # "나머지 1건을 보려면 "나머지 보여줘"라고 말씀해 주세요" (159 11-02 13:31): the model's own wording
+    # of the paging hint, "라고/이라고" instead of the server's "로".
     _MORE_LINE = re.compile(r"이어서\s*보려면\s*" + _Q + r"나머지\s*보여\s*줘" + _Q
-                            + r"|나머지(?!\s*0\s*[개건대줄명곳])\s*[^\n]{0,30}?" + _Q + r"나머지\s*보여\s*줘" + _Q + r"\s*로")
+                            + r"|나머지(?!\s*0\s*[개건대줄명곳])\s*[^\n]{0,30}?" + _Q + r"나머지\s*보여\s*줘" + _Q + r"\s*(?:로|이?라고)")
     _END_LINE = re.compile(r"문서의\s*끝입니다")
     # Heading variants seen from models: bold, "###", no colon, full-width colon.
-    _HEAD = re.compile(r"^\s*(?:#+\s*)?\**\s*(이어서\s*물어볼\s*만한\s*것|관련)\s*\**\s*[:：]?\s*\**\s*$")
+    # The server's heading, and the model's rewordings of it ("이어서 다음과 같이 질문하실 수 있습니다:",
+    # "이어서 물어볼 수 있는 질문:", 159 11-02 03:55): anything that starts with 이어서 and ends with a colon.
+    _HEAD = re.compile(r"^\s*(?:#+\s*)?\**\s*(?:(이어서\s*물어볼\s*만한\s*것|관련)\s*\**\s*[:：]?|(이어서[^|:：'\"]{0,30})\s*\**\s*[:：])\s*\**\s*$")
     _ITEM = re.compile(r"^(?:[-*•]|\d+[.)])\s+(.*)$")
     # The model's own offer list under another heading ("추가로 확인이 필요한 사항이 있다면 말씀해
     # 주세요:") with each item a quoted question and a gloss: '"다음 변화점 보여줘" (남은 변화점 확인)'
@@ -736,7 +740,7 @@ class Pipe:
             h = cls._HEAD.match(line)
             if not h:
                 continue
-            key = "next" if h.group(1).startswith("이어서") else "related"
+            key = "next" if (h.group(1) or h.group(2) or "").startswith("이어서") else "related"
             got = []
             for j in range(i + 1, len(lines)):
                 raw = lines[j]
@@ -830,7 +834,7 @@ class Pipe:
             bare = line.rstrip("\r")
             if self.state == "text":
                 h = self.head_re.match(bare)
-                if h and h.group(1).startswith("이어서"):
+                if h and (h.group(1) or h.group(2) or "").startswith("이어서"):
                     self.state, self.held = "list", ""
                     return ""
                 if self.offer_head_re is not None and self.offer_head_re.match(bare):
@@ -843,6 +847,13 @@ class Pipe:
                     self.offer_held += line + "\n"
                     return ""
                 if self.quoted_re is not None and self.quoted_re.match(t):
+                    self.offer_items.append(t)
+                    self.offer_held += line + "\n"
+                    return ""
+                # A plain "- 질문" item under a heading that names questions ("다음 단계로 무엇을
+                # 도와드릴까요?", "추천 질문:") is an offer too (159 11-02 13:31: no quotes, no chips).
+                if (self.item_re.match(t) and re.search(r"질문|도와드릴|추천", self.offer_held.split("\n", 1)[0])
+                        and (self.offer_items or not re.search(r"[|]", t))):
                     self.offer_items.append(t)
                     self.offer_held += line + "\n"
                     return ""

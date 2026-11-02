@@ -99,6 +99,17 @@ class TestChips(unittest.TestCase):
         self.assertIn("확인이 필요한 사항", kept)
         self.assertIn("네트워크를 점검하세요", kept)
 
+    def test_the_models_paging_sentence_and_reworded_heading_still_give_chips(self):
+        # 159 11-02 13:31: "나머지 1건을 보려면 "나머지 보여줘"라고 말씀해 주세요." and no list -> no chips.
+        self.assertEqual(P.follow_up_chips("표\n\n나머지 1건을 보려면 \"나머지 보여줘\"라고 말씀해 주세요."), ["나머지 보여줘"])
+        # 03:55: the model reworded the heading and wrote plain items.
+        a = "답.\n\n**이어서 다음과 같이 질문하실 수 있습니다:**\n*   진행 중 알림 간트 차트로 그려줘\n*   진행 중 알림 보여줘\n*   나머지 보여줘 (INFORMATION 등 낮은 단계 알림 확인)\n"
+        self.assertEqual(P.follow_up_chips(a), ["진행 중 알림 간트 차트로 그려줘", "진행 중 알림 보여줘", "나머지 보여줘 (INFORMATION 등 낮은 단계 알림 확인)"])
+        p = P()
+        shown = p.strip_next_list("답.\n\n**다음 단계로 무엇을 도와드릴까요?**\n* 진행 중 알림 간트 차트로 그려줘\n* 나머지 보여줘\n", "c12")
+        self.assertEqual(shown.strip(), "답.")
+        self.assertEqual(p._next_lists["c12"], ["- 진행 중 알림 간트 차트로 그려줘", "- 나머지 보여줘"])
+
     def test_the_offer_list_is_hidden_from_a_stream_too(self):
         p = P()
         text = "답.\n\n**추천 질문:**\n* `esx09 알림 보여줘` (경고 확인)\n* `esx09 변화 시점 그래프 보여줘`"

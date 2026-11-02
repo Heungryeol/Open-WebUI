@@ -67,6 +67,10 @@ class TestChips(unittest.TestCase):
         both = a + "\n이어서 물어볼 만한 것:\n- 나머지 보여줘\n"
         self.assertEqual(P.follow_up_chips(both), ["나머지 보여줘"])
         self.assertEqual(P.follow_up_chips("표\n- \"a\" (x)\n\n끝 문장입니다."), [])
+        # 11-02: backticked items under the model's own heading, with and without a gloss.
+        b = ("...\n\n**다음 단계로 무엇을 도와드릴까요?**\n* `sc-nfs01-ds 왜 문제야?` (스토리지 이슈 원인 분석)\n"
+             "* `kr-mgmt-cl01 왜 문제야?` (네트워크 이슈 원인 분석)\n* `나머지 보여줘`\n")
+        self.assertEqual(P.follow_up_chips(b), ["sc-nfs01-ds 왜 문제야?", "kr-mgmt-cl01 왜 문제야?", "나머지 보여줘"])
 
     def test_zero_left_is_not_more(self):
         self.assertEqual(P.follow_up_chips("나머지 0개는 '나머지 보여줘' 로.\n\n이어서 물어볼 만한 것:\n- a"), ["a"])

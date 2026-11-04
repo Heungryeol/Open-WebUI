@@ -73,6 +73,14 @@ class Pipe:
         ENABLE_STREAMING: bool = Field(
             default=True, description="스트리밍 응답 사용 여부."
         )
+        FORWARD_PARAMS: str = Field(
+            default="max_tokens",
+            description=(
+                "Open WebUI 의 Advanced Params 중 PAIS 로 넘길 키(쉼표로 구분). 비우면 아무것도 넘기지 않는다. "
+                "PAIS 가 모르는 키에 400 을 내면 그 키를 여기서 뺀다. "
+                "쓸 만한 것: max_tokens, temperature, top_p, top_k, frequency_penalty, presence_penalty, seed, stop."
+            ),
+        )
         CONNECTION_TIMEOUT: float = Field(
             default=10.0, description="연결 타임아웃(초)."
         )
@@ -473,6 +481,22 @@ class Pipe:
                 p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"
             )
         return ""
+
+    def _forwarded_param_keys(self) -> list:
+        """FORWARD_PARAMS 밸브가 고른 키들. 빈 값·공백은 버린다.
+
+        Open WebUI 는 Advanced Params 를 요청 본문에 그대로 싣는데, 이 pipe 는 messages 와
+        stream 만 PAIS 로 넘겼다. max_tokens 를 걸어도 효과가 없던 까닭이다(BRCM-MCP #271).
+        PAIS 가 받는 키를 모르므로 밸브로 하나씩 늘린다.
+        """
+        raw = self.valves.FORWARD_PARAMS or ""
+        seen, keys = set(), []
+        for key in raw.replace("\n", ",").split(","):
+            key = key.strip()
+            if key and key not in seen and key not in ("model", "messages", "stream"):
+                seen.add(key)
+                keys.append(key)
+        return keys
 
     def _shape_history(self, messages: list) -> list:
         """Trim what earlier turns the agent sees, so it calls a tool for every
@@ -1004,6 +1028,15 @@ class Pipe:
             "messages": self._shape_history(body.get("messages", [])),
             "stream": body.get("stream", self.valves.ENABLE_STREAMING),
         }
+        # Open WebUI 의 Advanced Params 를 PAIS 로 넘긴다. 2026-11-04: 모델이 머리줄 한 문장을
+        # 587회 반복해 78초 동안 21,800자를 쏟고 연결이 끊겼는데(BRCM-MCP #271), Controls 에서
+        # max_tokens=2048 을 걸어도 아무 일도 일어나지 않았다 -- 여기서 두 키만 담아 보내느라
+        # 그 값이 버려지고 있었다. 위 model 주석이 보이듯 PAIS 는 모르는 키에 400 을 내므로,
+        # 밸브로 키를 하나씩 늘리고 400 이 나면 뺀다. 기본값은 max_tokens 하나다.
+        for key in self._forwarded_param_keys():
+            value = body.get(key)
+            if value is not None:
+                payload[key] = value
         if self.valves.FORCE_TOOL_CHOICE:
             payload["tool_choice"] = "required"
 

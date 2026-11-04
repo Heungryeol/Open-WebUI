@@ -39,6 +39,38 @@ class Stream:
         pass
 
 
+class TestForwardedParams(unittest.TestCase):
+    """Open WebUI 의 Advanced Params 중 밸브가 고른 것만 PAIS payload 로 넘어간다.
+
+    2026-11-04: 모델이 머리줄 한 문장을 587회 반복해 78초 동안 21,800자를 쏟고 연결이 끊겼는데
+    (BRCM-MCP #271), Controls 에서 max_tokens=2048 을 걸어도 아무 일도 없었다 -- pipe 가 messages 와
+    stream 만 담아 보내 그 값이 버려지고 있었다. PAIS 는 모르는 키에 400(UNEXPECTED_MODEL) 을 내므로
+    밸브로 하나씩 늘린다.
+    """
+
+    def _pipe(self, forward="max_tokens"):
+        p = P()
+        p.valves.FORWARD_PARAMS = forward
+        return p
+
+    def test_the_default_valve_forwards_only_max_tokens(self):
+        self.assertEqual(self._pipe()._forwarded_param_keys(), ["max_tokens"])
+
+    def test_several_keys_with_blanks_and_duplicates(self):
+        p = self._pipe(" max_tokens , temperature ,, max_tokens , top_p ")
+        self.assertEqual(p._forwarded_param_keys(), ["max_tokens", "temperature", "top_p"])
+
+    def test_an_empty_valve_forwards_nothing(self):
+        for blank in ("", "   ", ",,"):
+            with self.subTest(valve=blank):
+                self.assertEqual(self._pipe(blank)._forwarded_param_keys(), [])
+
+    def test_the_payloads_own_keys_can_never_be_overwritten(self):
+        # PAIS 는 payload 에 model 이 있으면 400 UNEXPECTED_MODEL 을 낸다; messages·stream 은 pipe 가 짓는다.
+        p = self._pipe("model, messages, stream, max_tokens")
+        self.assertEqual(p._forwarded_param_keys(), ["max_tokens"])
+
+
 class TestChips(unittest.TestCase):
     def test_the_answer_list_is_copied_with_more_first(self):
         self.assertEqual(P.follow_up_chips(KB), ["나머지 보여줘",

@@ -80,6 +80,53 @@ class TestForwardedParams(unittest.TestCase):
         self.assertEqual(p._forwarded_param_keys(), ["max_tokens"])
 
 
+class TestFixedParams(unittest.TestCase):
+    """FORWARD_DEFAULTS 가 고정한 값이 Controls 보다 우선한다.
+
+    Controls 는 채팅마다다. 새 채팅은 비어 있고(API, ask --webui) 사용자가 지울 수도 있으므로,
+    안전장치(max_tokens)를 Controls 에만 두면 걸리지 않는 경로가 남는다. 2026-11-04 159 에서
+    모델이 한 문장을 587회 반복해 연결이 끊겼고(BRCM-MCP #271), 상한이 모든 경로에 걸려야 한다.
+    """
+
+    def _pipe(self, fixed="", forward="max_tokens, temperature"):
+        p = P()
+        p.valves.FORWARD_PARAMS = forward
+        p.valves.FORWARD_DEFAULTS = fixed
+        return p
+
+    def test_no_fixed_value_means_controls_decides(self):
+        p = self._pipe()
+        self.assertEqual(p.forwarded_values({"max_tokens": 2048}), {"max_tokens": 2048})
+        self.assertEqual(p.forwarded_values({}), {})
+
+    def test_a_fixed_value_wins_over_controls_and_over_an_empty_one(self):
+        p = self._pipe("max_tokens=4096")
+        self.assertEqual(p.forwarded_values({"max_tokens": 2048}), {"max_tokens": 4096})
+        self.assertEqual(p.forwarded_values({}), {"max_tokens": 4096})          # 새 채팅에도 걸린다
+
+    def test_fixed_and_controls_live_side_by_side(self):
+        p = self._pipe("max_tokens=4096")
+        self.assertEqual(p.forwarded_values({"max_tokens": 1, "temperature": 0.2}),
+                         {"max_tokens": 4096, "temperature": 0.2})
+
+    def test_values_keep_their_type(self):
+        p = self._pipe("max_tokens=4096, temperature=0.2, seed=7", forward="")
+        self.assertEqual(p.forwarded_values({}), {"max_tokens": 4096, "temperature": 0.2, "seed": 7})
+
+    def test_a_fixed_key_is_sent_even_when_the_list_leaves_it_out(self):
+        # 적은 사람이 뜻한 것이다; FORWARD_PARAMS 는 Controls 를 거르는 목록이다.
+        p = self._pipe("top_k=20", forward="max_tokens")
+        self.assertEqual(p.forwarded_values({"top_k": 99}), {"top_k": 20})
+
+    def test_a_broken_piece_is_dropped_not_raised(self):
+        p = self._pipe("max_tokens=4096, 이건=, 저건, =3", forward="")
+        self.assertEqual(p.forwarded_values({}), {"max_tokens": 4096, "이건": ""})
+
+    def test_the_payloads_own_keys_can_never_be_fixed(self):
+        p = self._pipe("model=x, messages=y, stream=false, max_tokens=4096", forward="")
+        self.assertEqual(p.forwarded_values({}), {"max_tokens": 4096})
+
+
 class TestChips(unittest.TestCase):
     def test_the_answer_list_is_copied_with_more_first(self):
         self.assertEqual(P.follow_up_chips(KB), ["나머지 보여줘",

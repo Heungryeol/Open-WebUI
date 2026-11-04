@@ -82,6 +82,16 @@ class Pipe:
                 "vLLM 전용 키(top_k, min_p, repetition_penalty)도 PAIS 가 받으면 넣을 수 있다."
             ),
         )
+        FORWARD_DEFAULTS: str = Field(
+            default="",
+            description=(
+                "밸브에서 고정할 값. \"max_tokens=4096, temperature=0.2\" 처럼 key=value 를 쉼표로 적는다. "
+                "여기 적은 키는 Controls 에서 무엇을 보내든 이 값으로 나간다 -- 새 채팅마다 Controls 가 비어 있는 "
+                "경로(API·ask --webui)와 사용자가 지우는 경우까지 덮으므로, 안전장치(예: max_tokens)는 여기 둔다. "
+                "여기 없는 키는 Controls 값을 그대로 넘긴다(FORWARD_PARAMS 목록 안에서). 값에 쉼표가 드는 키(stop)는 "
+                "Controls 로 보낸다."
+            ),
+        )
         FORWARD_RETRY: bool = Field(
             default=True,
             description=(
@@ -505,6 +515,53 @@ class Pipe:
                 seen.add(key)
                 keys.append(key)
         return keys
+
+    _PAYLOAD_OWN = ("model", "messages", "stream")
+
+    @staticmethod
+    def _coerce(text: str):
+        """\"4096\" -> 4096, \"0.2\" -> 0.2, \"true\" -> True; 나머지는 글자 그대로."""
+        t = (text or "").strip()
+        if re.fullmatch(r"-?\d+", t):
+            return int(t)
+        if re.fullmatch(r"-?\d*\.\d+", t):
+            return float(t)
+        if t.lower() in ("true", "false"):
+            return t.lower() == "true"
+        return t
+
+    def _fixed_params(self) -> dict:
+        """FORWARD_DEFAULTS 가 고정한 값. 잘못 적은 조각은 조용히 버린다 -- 밸브 한 줄 때문에
+        모든 질문이 죽는 것보다, 그 키가 안 나가는 편이 낫다(로그에는 남는다)."""
+        fixed = {}
+        for piece in (self.valves.FORWARD_DEFAULTS or "").replace("\n", ",").split(","):
+            if "=" not in piece:
+                continue
+            key, _, value = piece.partition("=")
+            key = key.strip()
+            if key and key not in self._PAYLOAD_OWN:
+                fixed[key] = self._coerce(value)
+        return fixed
+
+    def forwarded_values(self, body: dict) -> dict:
+        """이 호출이 PAIS 로 보낼 샘플링 파라미터.
+
+        밸브의 고정값이 Controls 보다 우선한다 -- 새 채팅마다 Controls 가 비어 있는 경로(API,
+        ask --webui)와 사용자가 지운 경우까지 덮어야 안전장치가 안전장치다. 고정하지 않은 키는
+        Controls 가 보낸 값을 그대로 넘긴다.
+        """
+        fixed = self._fixed_params()
+        keys = list(self._forwarded_param_keys())
+        for key in fixed:                      # 고정한 키는 목록에 없어도 보낸다(적은 사람이 뜻한 것)
+            if key not in keys:
+                keys.append(key)
+        out = {}
+        for key in keys:
+            if key in fixed:
+                out[key] = fixed[key]
+            elif (body or {}).get(key) is not None:
+                out[key] = body[key]
+        return out
 
     def _shape_history(self, messages: list) -> list:
         """Trim what earlier turns the agent sees, so it calls a tool for every
@@ -1041,14 +1098,11 @@ class Pipe:
         # max_tokens=2048 을 걸어도 아무 일도 일어나지 않았다 -- 여기서 두 키만 담아 보내느라
         # 그 값이 버려지고 있었다. 위 model 주석이 보이듯 PAIS 는 모르는 키에 400 을 내므로,
         # 밸브로 키를 하나씩 늘리고 400 이 나면 뺀다. 기본값은 max_tokens 하나다.
-        forwarded = []
-        for key in self._forwarded_param_keys():
-            value = body.get(key)
-            if value is not None:
-                payload[key] = value
-                forwarded.append(key)
+        sampling = self.forwarded_values(body)
+        payload.update(sampling)
+        forwarded = list(sampling)
         if forwarded:
-            logger.info(f"pais pipe: forwarding {forwarded} to PAIS")
+            logger.info(f"pais pipe: forwarding {sampling} to PAIS")
         if self.valves.FORCE_TOOL_CHOICE:
             payload["tool_choice"] = "required"
 

@@ -74,11 +74,19 @@ class Pipe:
             default=True, description="스트리밍 응답 사용 여부."
         )
         FORWARD_PARAMS: str = Field(
-            default="max_tokens",
+            default="max_tokens, temperature, top_p, frequency_penalty, presence_penalty, seed, stop",
             description=(
-                "Open WebUI 의 Advanced Params 중 PAIS 로 넘길 키(쉼표로 구분). 비우면 아무것도 넘기지 않는다. "
-                "PAIS 가 모르는 키에 400 을 내면 그 키를 여기서 뺀다. "
-                "쓸 만한 것: max_tokens, temperature, top_p, top_k, frequency_penalty, presence_penalty, seed, stop."
+                "Open WebUI 의 Advanced Params 중 PAIS 로 넘길 키(쉼표로 구분). 비우면 수정 전처럼 아무것도 넘기지 않는다. "
+                "기본값은 OpenAI 호환 API 가 공통으로 받는 것들이다. PAIS 가 모르는 키에 400 을 내면 그 호출만 "
+                "파라미터 없이 한 번 다시 보내고 경고를 남기므로(FORWARD_RETRY), 여기에 더 넣어 보는 비용이 낮다. "
+                "vLLM 전용 키(top_k, min_p, repetition_penalty)도 PAIS 가 받으면 넣을 수 있다."
+            ),
+        )
+        FORWARD_RETRY: bool = Field(
+            default=True,
+            description=(
+                "넘긴 파라미터 때문에 400 이 나면 그 호출만 파라미터 없이 한 번 다시 보낸다. "
+                "끄면 400 이 그대로 사용자에게 보인다(어느 키가 문제인지 가릴 때)."
             ),
         )
         CONNECTION_TIMEOUT: float = Field(
@@ -1033,10 +1041,14 @@ class Pipe:
         # max_tokens=2048 을 걸어도 아무 일도 일어나지 않았다 -- 여기서 두 키만 담아 보내느라
         # 그 값이 버려지고 있었다. 위 model 주석이 보이듯 PAIS 는 모르는 키에 400 을 내므로,
         # 밸브로 키를 하나씩 늘리고 400 이 나면 뺀다. 기본값은 max_tokens 하나다.
+        forwarded = []
         for key in self._forwarded_param_keys():
             value = body.get(key)
             if value is not None:
                 payload[key] = value
+                forwarded.append(key)
+        if forwarded:
+            logger.info(f"pais pipe: forwarding {forwarded} to PAIS")
         if self.valves.FORCE_TOOL_CHOICE:
             payload["tool_choice"] = "required"
 
@@ -1055,6 +1067,21 @@ class Pipe:
             if response.status_code == 401:
                 response.close()
                 token = self._get_access_token(force_refresh=True)
+                response = do_request(token)
+
+            # PAIS 가 모르는 파라미터에 400 을 낸다(위 model 주석). 어느 키를 받는지 미리 알 수 없으므로
+            # 그 호출만 파라미터를 빼고 한 번 다시 보내고, 어느 키였는지 로그에 남긴다 -- 밸브에 키를
+            # 더해 보는 값이 싸진다. 답은 나가되 그 파라미터는 안 먹은 것이므로 경고로 남긴다.
+            if response.status_code == 400 and forwarded and self.valves.FORWARD_RETRY:
+                body_text = response.read().decode("utf-8", errors="ignore")
+                response.close()
+                logger.warning(
+                    f"pais pipe: PAIS 400 with forwarded params {forwarded} -- retrying without them. "
+                    f"body={body_text[:300]}"
+                )
+                for key in forwarded:
+                    payload.pop(key, None)
+                forwarded = []
                 response = do_request(token)
 
             if response.status_code != 200:

@@ -53,8 +53,17 @@ class TestForwardedParams(unittest.TestCase):
         p.valves.FORWARD_PARAMS = forward
         return p
 
-    def test_the_default_valve_forwards_only_max_tokens(self):
-        self.assertEqual(self._pipe()._forwarded_param_keys(), ["max_tokens"])
+    def test_the_default_valve_forwards_the_common_openai_params(self):
+        # 2026-11-04 159: PAIS 가 max_tokens 를 받아 vLLM 까지 넘기는 것이 확인됐다(400 없음, 답이
+        # 21,800자에서 3,970자로 잘림). 나머지도 같은 꼴이라 기본값에 넣고, 400 이 나면 FORWARD_RETRY
+        # 가 그 호출만 파라미터 없이 다시 보낸다.
+        self.assertEqual(
+            P()._forwarded_param_keys(),
+            ["max_tokens", "temperature", "top_p", "frequency_penalty", "presence_penalty", "seed", "stop"],
+        )
+
+    def test_one_named_key_still_works(self):
+        self.assertEqual(self._pipe("max_tokens")._forwarded_param_keys(), ["max_tokens"])
 
     def test_several_keys_with_blanks_and_duplicates(self):
         p = self._pipe(" max_tokens , temperature ,, max_tokens , top_p ")

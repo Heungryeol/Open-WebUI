@@ -81,13 +81,29 @@ Open WebUI 는 답이 끝나면 제목·후속 질문 칩·태그를 만들려�
 
 **159 는 k8s 다**(namespace `open-webui`, **StatefulSet** `open-webui`, 파드 `open-webui-0`).
 진입 HTML 은 `app.html` 이 아니라 **`/app/build/index.html`** 이고, 그것이
-`custom.css` 를 참조한다. 이미지에 `/app/build/static/custom.css` 가 비어 있는
-채로 들어 있으므로, 거기에 **덮어쓴다**(2026-11-05 실측).
+`/static/custom.css` 를 참조한다.
+
+**`custom.css` 는 파드 안에 두 군데 있고, 서빙되는 것은 백엔드 쪽이다**(2026-11-05
+실측, 여기서 한 번 틀렸다):
+
+```
+/app/backend/open_webui/static/custom.css   <= 이것이 /static/custom.css 로 나간다
+/app/build/static/custom.css                <= 프론트 빌드 산출물. 넣어도 아무 일이 없다
+```
+
+`main.py` 의 `app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')`
+가 그렇게 한다. 빌드 쪽에 3,362바이트를 넣었는데
+`curl localhost:8080/static/custom.css` 가 `status=200 bytes=0` 을 돌려주어
+알았다 — 브라우저 캐시도 서비스 워커도 아니었고, 시크릿 창에서도 똑같이 안 먹었다.
 
 시험(파드가 재시작되면 사라진다):
 
 ```bash
-kubectl -n open-webui cp static/custom.css open-webui-0:/app/build/static/custom.css
+kubectl -n open-webui cp static/custom.css \
+    open-webui-0:/app/backend/open_webui/static/custom.css
+kubectl -n open-webui exec open-webui-0 -c open-webui -- \
+    curl -s -o /dev/null -w '%{http_code} %{size_download}\n' \
+    http://127.0.0.1:8080/static/custom.css      # 200 3362 이어야 한다
 ```
 
 영구(ConfigMap 을 `subPath` 로 그 파일 위에 마운트):

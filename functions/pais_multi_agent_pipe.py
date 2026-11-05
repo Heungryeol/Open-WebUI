@@ -92,6 +92,16 @@ class Pipe:
                 "Controls 로 보낸다."
             ),
         )
+        FORWARD_FALLBACK: str = Field(
+            default="max_tokens=8192",
+            description=(
+                "아무도 값을 안 준 키에 쓸 값. 우선순위는 FORWARD_DEFAULTS > Controls > 여기다 -- "
+                "Controls 에서 일부러 낮춰 보는 것을 막지 않으면서, 새 채팅·API·ask --webui 처럼 "
+                "Controls 가 비어 있는 경로에도 상한이 걸린다. 기본 8192 는 서버가 낼 수 있는 가장 긴 답 "
+                "(KB 전문 VC_KB_FULL_CHARS=8000자)이 안 잘리는 값이다: 159 실측으로 토큰당 약 1.94자라 "
+                "8192 토큰이 약 15,900자다. 비우면 아무것도 안 건다."
+            ),
+        )
         FORWARD_RETRY: bool = Field(
             default=True,
             description=(
@@ -530,11 +540,12 @@ class Pipe:
             return t.lower() == "true"
         return t
 
-    def _fixed_params(self) -> dict:
+    def _fixed_params(self, raw: str = None) -> dict:
         """FORWARD_DEFAULTS 가 고정한 값. 잘못 적은 조각은 조용히 버린다 -- 밸브 한 줄 때문에
         모든 질문이 죽는 것보다, 그 키가 안 나가는 편이 낫다(로그에는 남는다)."""
         fixed = {}
-        for piece in (self.valves.FORWARD_DEFAULTS or "").replace("\n", ",").split(","):
+        text = self.valves.FORWARD_DEFAULTS if raw is None else raw
+        for piece in (text or "").replace("\n", ",").split(","):
             if "=" not in piece:
                 continue
             key, _, value = piece.partition("=")
@@ -546,13 +557,18 @@ class Pipe:
     def forwarded_values(self, body: dict) -> dict:
         """이 호출이 PAIS 로 보낼 샘플링 파라미터.
 
-        밸브의 고정값이 Controls 보다 우선한다 -- 새 채팅마다 Controls 가 비어 있는 경로(API,
-        ask --webui)와 사용자가 지운 경우까지 덮어야 안전장치가 안전장치다. 고정하지 않은 키는
-        Controls 가 보낸 값을 그대로 넘긴다.
+        FORWARD_DEFAULTS(고정) > Controls > FORWARD_FALLBACK(아무도 안 줬을 때) 순이다.
+
+        고정값이 Controls 를 이기는 것은 새 채팅마다 Controls 가 비어 있는 경로(API, ask --webui)와
+        사용자가 지운 경우까지 덮어야 안전장치가 안전장치이기 때문이다. 폴백은 그 아래에 둔다 --
+        max_tokens 8192 는 안전장치가 아니라 "정상 답이 안 잘리는 값"(KB 전문 8,000자)이라,
+        Controls 에서 일부러 낮춰 보는 것을 막으면 안 된다.
+        FORWARD_DEFAULTS (forced) > Controls > FORWARD_FALLBACK (when nobody gave one).
         """
         fixed = self._fixed_params()
+        fallback = self._fixed_params(self.valves.FORWARD_FALLBACK)
         keys = list(self._forwarded_param_keys())
-        for key in fixed:                      # 고정한 키는 목록에 없어도 보낸다(적은 사람이 뜻한 것)
+        for key in list(fixed) + list(fallback):   # 적어 둔 키는 목록에 없어도 보낸다(적은 사람이 뜻한 것)
             if key not in keys:
                 keys.append(key)
         out = {}
@@ -561,6 +577,8 @@ class Pipe:
                 out[key] = fixed[key]
             elif (body or {}).get(key) is not None:
                 out[key] = body[key]
+            elif key in fallback:
+                out[key] = fallback[key]
         return out
 
     def _shape_history(self, messages: list) -> list:

@@ -88,16 +88,49 @@ class TestFixedParams(unittest.TestCase):
     모델이 한 문장을 587회 반복해 연결이 끊겼고(BRCM-MCP #271), 상한이 모든 경로에 걸려야 한다.
     """
 
-    def _pipe(self, fixed="", forward="max_tokens, temperature"):
+    def _pipe(self, fixed="", forward="max_tokens, temperature", fallback=""):
         p = P()
         p.valves.FORWARD_PARAMS = forward
         p.valves.FORWARD_DEFAULTS = fixed
+        p.valves.FORWARD_FALLBACK = fallback      # 이 묶음은 고정값·Controls 만 본다
         return p
 
     def test_no_fixed_value_means_controls_decides(self):
         p = self._pipe()
         self.assertEqual(p.forwarded_values({"max_tokens": 2048}), {"max_tokens": 2048})
-        self.assertEqual(p.forwarded_values({}), {})
+        self.assertEqual(p.forwarded_values({}), {})          # 폴백도 비었으면 아무것도 안 보낸다
+
+    def test_the_three_tiers_are_fixed_then_controls_then_fallback(self):
+        """FORWARD_DEFAULTS > Controls > FORWARD_FALLBACK.
+
+        폴백이 Controls 아래인 것이 핵심이다: max_tokens 8192 는 안전장치가 아니라 "정상 답이
+        안 잘리는 값"(KB 전문 VC_KB_FULL_CHARS=8000자)이라, Controls 에서 일부러 낮춰 보는 것을
+        막으면 안 된다. 반대로 고정값은 Controls 를 이겨야 안전장치 노릇을 한다.
+        """
+        p = self._pipe(fallback="max_tokens=8192")
+        self.assertEqual(p.forwarded_values({}), {"max_tokens": 8192})                 # 아무도 안 줌
+        self.assertEqual(p.forwarded_values({"max_tokens": 2048}), {"max_tokens": 2048})  # Controls 가 이김
+        p = self._pipe(fixed="max_tokens=4096", fallback="max_tokens=8192")
+        self.assertEqual(p.forwarded_values({"max_tokens": 2048}), {"max_tokens": 4096})  # 고정값이 이김
+        self.assertEqual(p.forwarded_values({}), {"max_tokens": 4096})
+
+    def test_the_shipped_fallback_covers_the_longest_answer_the_servers_can_make(self):
+        """기본값은 8192 여야 한다. 4096(약 7,900자)은 KB 전문 8,000자를 아슬아슬하게 자른다.
+
+        환산은 159 실측이다: max_tokens=2048 이 21,800자를 3,970자로 잘랐다 -> 토큰당 약 1.94자.
+        """
+        self.assertEqual(P().valves.FORWARD_FALLBACK, "max_tokens=8192")
+        self.assertGreater(8192 * 1.94, 8000)                 # KB 전문이 들어간다
+
+    def test_a_fallback_key_outside_the_forward_list_is_still_sent(self):
+        """폴백에 적은 키는 FORWARD_PARAMS 목록에 없어도 나간다 -- 적은 사람이 뜻한 것이다."""
+        p = self._pipe(forward="temperature", fallback="max_tokens=8192")
+        self.assertEqual(p.forwarded_values({}), {"max_tokens": 8192})
+
+    def test_an_empty_fallback_sends_nothing(self):
+        """비우면 수정 전과 같다 -- 폴백이 강제가 되면 끌 방법이 없어진다."""
+        self.assertEqual(self._pipe(fallback="").forwarded_values({}), {})
+        self.assertEqual(self._pipe(fallback="   ").forwarded_values({}), {})
 
     def test_a_fixed_value_wins_over_controls_and_over_an_empty_one(self):
         p = self._pipe("max_tokens=4096")

@@ -79,15 +79,30 @@ Open WebUI 는 답이 끝나면 제목·후속 질문 칩·태그를 만들려�
 현재 두 규칙이다 — 간트 차트를 답변 영역 폭에 맞춤(BRCM-MCP #304), 두 열 표의 첫 열을
 30% 로(#282). 왜 그렇게 했는지와 실측값은 파일 안 주석에 있다.
 
-159 에 적용:
+**159 는 k8s 다**(namespace `open-webui`, **StatefulSet** `open-webui`, 파드 `open-webui-0`).
+진입 HTML 은 `app.html` 이 아니라 **`/app/build/index.html`** 이고, 그것이
+`custom.css` 를 참조한다. 이미지에 `/app/build/static/custom.css` 가 비어 있는
+채로 들어 있으므로, 거기에 **덮어쓴다**(2026-11-05 실측).
+
+시험(파드가 재시작되면 사라진다):
 
 ```bash
-sudo install -m 0644 static/custom.css /app/build/static/custom.css   # 경로는 설치 방식에 따라 다르다
-docker compose restart open-webui                                     # 컨테이너면 이쪽
+kubectl -n open-webui cp static/custom.css open-webui-0:/app/build/static/custom.css
 ```
 
-적용 뒤 브라우저를 **강력 새로고침**해야 보인다. 되돌리기는 파일을 지우면 끝이다.
-`app.html` 이 `/static/custom.css` 를 불러오므로 파일 이름은 그대로 두어야 한다.
+영구(ConfigMap 을 `subPath` 로 그 파일 위에 마운트):
 
-159 는 다시 올릴 때가 있다. 그때 이 파일이 서버에만 있으면 조용히 사라지므로
-저장소에 둔다 — 재배포 뒤 위 한 줄을 다시 돌린다.
+```bash
+kubectl -n open-webui create configmap brcm-custom-css     --from-file=custom.css=static/custom.css --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n open-webui rollout restart statefulset/open-webui
+```
+
+`subPath` 마운트는 ConfigMap 을 고쳐도 자동 반영되지 않는다 — 바꿀 때마다
+`create configmap … | kubectl apply` 뒤 `rollout restart` 다. 되돌리기는 마운트를
+빼고 `rollout restart` 한다.
+
+적용 뒤 브라우저를 **강력 새로고침**해야 보인다. 파일 이름은 그대로 두어야 한다 —
+`index.html` 이 그 경로를 참조한다.
+
+159 는 다시 올릴 때가 있다. 그때 이 파일이 파드 안에만 있으면 조용히 사라지므로
+저장소에 둔다.

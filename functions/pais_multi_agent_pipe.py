@@ -73,6 +73,42 @@ class Pipe:
         ENABLE_STREAMING: bool = Field(
             default=True, description="스트리밍 응답 사용 여부."
         )
+        FORWARD_PARAMS: str = Field(
+            default="max_tokens, temperature, top_p, frequency_penalty, presence_penalty, seed, stop",
+            description=(
+                "Open WebUI 의 Advanced Params 중 PAIS 로 넘길 키(쉼표로 구분). 비우면 수정 전처럼 아무것도 넘기지 않는다. "
+                "기본값은 OpenAI 호환 API 가 공통으로 받는 것들이다. PAIS 가 모르는 키에 400 을 내면 그 호출만 "
+                "파라미터 없이 한 번 다시 보내고 경고를 남기므로(FORWARD_RETRY), 여기에 더 넣어 보는 비용이 낮다. "
+                "vLLM 전용 키(top_k, min_p, repetition_penalty)도 PAIS 가 받으면 넣을 수 있다."
+            ),
+        )
+        FORWARD_DEFAULTS: str = Field(
+            default="",
+            description=(
+                "밸브에서 고정할 값. \"max_tokens=4096, temperature=0.2\" 처럼 key=value 를 쉼표로 적는다. "
+                "여기 적은 키는 Controls 에서 무엇을 보내든 이 값으로 나간다 -- 새 채팅마다 Controls 가 비어 있는 "
+                "경로(API·ask --webui)와 사용자가 지우는 경우까지 덮으므로, 안전장치(예: max_tokens)는 여기 둔다. "
+                "여기 없는 키는 Controls 값을 그대로 넘긴다(FORWARD_PARAMS 목록 안에서). 값에 쉼표가 드는 키(stop)는 "
+                "Controls 로 보낸다."
+            ),
+        )
+        FORWARD_FALLBACK: str = Field(
+            default="max_tokens=8192",
+            description=(
+                "아무도 값을 안 준 키에 쓸 값. 우선순위는 FORWARD_DEFAULTS > Controls > 여기다 -- "
+                "Controls 에서 일부러 낮춰 보는 것을 막지 않으면서, 새 채팅·API·ask --webui 처럼 "
+                "Controls 가 비어 있는 경로에도 상한이 걸린다. 기본 8192 는 서버가 낼 수 있는 가장 긴 답 "
+                "(KB 전문 VC_KB_FULL_CHARS=8000자)이 안 잘리는 값이다: 159 실측으로 토큰당 약 1.94자라 "
+                "8192 토큰이 약 15,900자다. 비우면 아무것도 안 건다."
+            ),
+        )
+        FORWARD_RETRY: bool = Field(
+            default=True,
+            description=(
+                "넘긴 파라미터 때문에 400 이 나면 그 호출만 파라미터 없이 한 번 다시 보낸다. "
+                "끄면 400 이 그대로 사용자에게 보인다(어느 키가 문제인지 가릴 때)."
+            ),
+        )
         CONNECTION_TIMEOUT: float = Field(
             default=10.0, description="연결 타임아웃(초)."
         )
@@ -473,6 +509,77 @@ class Pipe:
                 p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"
             )
         return ""
+
+    def _forwarded_param_keys(self) -> list:
+        """FORWARD_PARAMS 밸브가 고른 키들. 빈 값·공백은 버린다.
+
+        Open WebUI 는 Advanced Params 를 요청 본문에 그대로 싣는데, 이 pipe 는 messages 와
+        stream 만 PAIS 로 넘겼다. max_tokens 를 걸어도 효과가 없던 까닭이다(BRCM-MCP #271).
+        PAIS 가 받는 키를 모르므로 밸브로 하나씩 늘린다.
+        """
+        raw = self.valves.FORWARD_PARAMS or ""
+        seen, keys = set(), []
+        for key in raw.replace("\n", ",").split(","):
+            key = key.strip()
+            if key and key not in seen and key not in ("model", "messages", "stream"):
+                seen.add(key)
+                keys.append(key)
+        return keys
+
+    _PAYLOAD_OWN = ("model", "messages", "stream")
+
+    @staticmethod
+    def _coerce(text: str):
+        """\"4096\" -> 4096, \"0.2\" -> 0.2, \"true\" -> True; 나머지는 글자 그대로."""
+        t = (text or "").strip()
+        if re.fullmatch(r"-?\d+", t):
+            return int(t)
+        if re.fullmatch(r"-?\d*\.\d+", t):
+            return float(t)
+        if t.lower() in ("true", "false"):
+            return t.lower() == "true"
+        return t
+
+    def _fixed_params(self, raw: str = None) -> dict:
+        """FORWARD_DEFAULTS 가 고정한 값. 잘못 적은 조각은 조용히 버린다 -- 밸브 한 줄 때문에
+        모든 질문이 죽는 것보다, 그 키가 안 나가는 편이 낫다(로그에는 남는다)."""
+        fixed = {}
+        text = self.valves.FORWARD_DEFAULTS if raw is None else raw
+        for piece in (text or "").replace("\n", ",").split(","):
+            if "=" not in piece:
+                continue
+            key, _, value = piece.partition("=")
+            key = key.strip()
+            if key and key not in self._PAYLOAD_OWN:
+                fixed[key] = self._coerce(value)
+        return fixed
+
+    def forwarded_values(self, body: dict) -> dict:
+        """이 호출이 PAIS 로 보낼 샘플링 파라미터.
+
+        FORWARD_DEFAULTS(고정) > Controls > FORWARD_FALLBACK(아무도 안 줬을 때) 순이다.
+
+        고정값이 Controls 를 이기는 것은 새 채팅마다 Controls 가 비어 있는 경로(API, ask --webui)와
+        사용자가 지운 경우까지 덮어야 안전장치가 안전장치이기 때문이다. 폴백은 그 아래에 둔다 --
+        max_tokens 8192 는 안전장치가 아니라 "정상 답이 안 잘리는 값"(KB 전문 8,000자)이라,
+        Controls 에서 일부러 낮춰 보는 것을 막으면 안 된다.
+        FORWARD_DEFAULTS (forced) > Controls > FORWARD_FALLBACK (when nobody gave one).
+        """
+        fixed = self._fixed_params()
+        fallback = self._fixed_params(self.valves.FORWARD_FALLBACK)
+        keys = list(self._forwarded_param_keys())
+        for key in list(fixed) + list(fallback):   # 적어 둔 키는 목록에 없어도 보낸다(적은 사람이 뜻한 것)
+            if key not in keys:
+                keys.append(key)
+        out = {}
+        for key in keys:
+            if key in fixed:
+                out[key] = fixed[key]
+            elif (body or {}).get(key) is not None:
+                out[key] = body[key]
+            elif key in fallback:
+                out[key] = fallback[key]
+        return out
 
     def _shape_history(self, messages: list) -> list:
         """Trim what earlier turns the agent sees, so it calls a tool for every
@@ -1004,6 +1111,16 @@ class Pipe:
             "messages": self._shape_history(body.get("messages", [])),
             "stream": body.get("stream", self.valves.ENABLE_STREAMING),
         }
+        # Open WebUI 의 Advanced Params 를 PAIS 로 넘긴다. 2026-11-04: 모델이 머리줄 한 문장을
+        # 587회 반복해 78초 동안 21,800자를 쏟고 연결이 끊겼는데(BRCM-MCP #271), Controls 에서
+        # max_tokens=2048 을 걸어도 아무 일도 일어나지 않았다 -- 여기서 두 키만 담아 보내느라
+        # 그 값이 버려지고 있었다. 위 model 주석이 보이듯 PAIS 는 모르는 키에 400 을 내므로,
+        # 밸브로 키를 하나씩 늘리고 400 이 나면 뺀다. 기본값은 max_tokens 하나다.
+        sampling = self.forwarded_values(body)
+        payload.update(sampling)
+        forwarded = list(sampling)
+        if forwarded:
+            logger.info(f"pais pipe: forwarding {sampling} to PAIS")
         if self.valves.FORCE_TOOL_CHOICE:
             payload["tool_choice"] = "required"
 
@@ -1022,6 +1139,21 @@ class Pipe:
             if response.status_code == 401:
                 response.close()
                 token = self._get_access_token(force_refresh=True)
+                response = do_request(token)
+
+            # PAIS 가 모르는 파라미터에 400 을 낸다(위 model 주석). 어느 키를 받는지 미리 알 수 없으므로
+            # 그 호출만 파라미터를 빼고 한 번 다시 보내고, 어느 키였는지 로그에 남긴다 -- 밸브에 키를
+            # 더해 보는 값이 싸진다. 답은 나가되 그 파라미터는 안 먹은 것이므로 경고로 남긴다.
+            if response.status_code == 400 and forwarded and self.valves.FORWARD_RETRY:
+                body_text = response.read().decode("utf-8", errors="ignore")
+                response.close()
+                logger.warning(
+                    f"pais pipe: PAIS 400 with forwarded params {forwarded} -- retrying without them. "
+                    f"body={body_text[:300]}"
+                )
+                for key in forwarded:
+                    payload.pop(key, None)
+                forwarded = []
                 response = do_request(token)
 
             if response.status_code != 200:

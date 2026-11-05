@@ -39,6 +39,127 @@ class Stream:
         pass
 
 
+class TestForwardedParams(unittest.TestCase):
+    """Open WebUI 의 Advanced Params 중 밸브가 고른 것만 PAIS payload 로 넘어간다.
+
+    2026-11-04: 모델이 머리줄 한 문장을 587회 반복해 78초 동안 21,800자를 쏟고 연결이 끊겼는데
+    (BRCM-MCP #271), Controls 에서 max_tokens=2048 을 걸어도 아무 일도 없었다 -- pipe 가 messages 와
+    stream 만 담아 보내 그 값이 버려지고 있었다. PAIS 는 모르는 키에 400(UNEXPECTED_MODEL) 을 내므로
+    밸브로 하나씩 늘린다.
+    """
+
+    def _pipe(self, forward="max_tokens"):
+        p = P()
+        p.valves.FORWARD_PARAMS = forward
+        return p
+
+    def test_the_default_valve_forwards_the_common_openai_params(self):
+        # 2026-11-04 159: PAIS 가 max_tokens 를 받아 vLLM 까지 넘기는 것이 확인됐다(400 없음, 답이
+        # 21,800자에서 3,970자로 잘림). 나머지도 같은 꼴이라 기본값에 넣고, 400 이 나면 FORWARD_RETRY
+        # 가 그 호출만 파라미터 없이 다시 보낸다.
+        self.assertEqual(
+            P()._forwarded_param_keys(),
+            ["max_tokens", "temperature", "top_p", "frequency_penalty", "presence_penalty", "seed", "stop"],
+        )
+
+    def test_one_named_key_still_works(self):
+        self.assertEqual(self._pipe("max_tokens")._forwarded_param_keys(), ["max_tokens"])
+
+    def test_several_keys_with_blanks_and_duplicates(self):
+        p = self._pipe(" max_tokens , temperature ,, max_tokens , top_p ")
+        self.assertEqual(p._forwarded_param_keys(), ["max_tokens", "temperature", "top_p"])
+
+    def test_an_empty_valve_forwards_nothing(self):
+        for blank in ("", "   ", ",,"):
+            with self.subTest(valve=blank):
+                self.assertEqual(self._pipe(blank)._forwarded_param_keys(), [])
+
+    def test_the_payloads_own_keys_can_never_be_overwritten(self):
+        # PAIS 는 payload 에 model 이 있으면 400 UNEXPECTED_MODEL 을 낸다; messages·stream 은 pipe 가 짓는다.
+        p = self._pipe("model, messages, stream, max_tokens")
+        self.assertEqual(p._forwarded_param_keys(), ["max_tokens"])
+
+
+class TestFixedParams(unittest.TestCase):
+    """FORWARD_DEFAULTS 가 고정한 값이 Controls 보다 우선한다.
+
+    Controls 는 채팅마다다. 새 채팅은 비어 있고(API, ask --webui) 사용자가 지울 수도 있으므로,
+    안전장치(max_tokens)를 Controls 에만 두면 걸리지 않는 경로가 남는다. 2026-11-04 159 에서
+    모델이 한 문장을 587회 반복해 연결이 끊겼고(BRCM-MCP #271), 상한이 모든 경로에 걸려야 한다.
+    """
+
+    def _pipe(self, fixed="", forward="max_tokens, temperature", fallback=""):
+        p = P()
+        p.valves.FORWARD_PARAMS = forward
+        p.valves.FORWARD_DEFAULTS = fixed
+        p.valves.FORWARD_FALLBACK = fallback      # 이 묶음은 고정값·Controls 만 본다
+        return p
+
+    def test_no_fixed_value_means_controls_decides(self):
+        p = self._pipe()
+        self.assertEqual(p.forwarded_values({"max_tokens": 2048}), {"max_tokens": 2048})
+        self.assertEqual(p.forwarded_values({}), {})          # 폴백도 비었으면 아무것도 안 보낸다
+
+    def test_the_three_tiers_are_fixed_then_controls_then_fallback(self):
+        """FORWARD_DEFAULTS > Controls > FORWARD_FALLBACK.
+
+        폴백이 Controls 아래인 것이 핵심이다: max_tokens 8192 는 안전장치가 아니라 "정상 답이
+        안 잘리는 값"(KB 전문 VC_KB_FULL_CHARS=8000자)이라, Controls 에서 일부러 낮춰 보는 것을
+        막으면 안 된다. 반대로 고정값은 Controls 를 이겨야 안전장치 노릇을 한다.
+        """
+        p = self._pipe(fallback="max_tokens=8192")
+        self.assertEqual(p.forwarded_values({}), {"max_tokens": 8192})                 # 아무도 안 줌
+        self.assertEqual(p.forwarded_values({"max_tokens": 2048}), {"max_tokens": 2048})  # Controls 가 이김
+        p = self._pipe(fixed="max_tokens=4096", fallback="max_tokens=8192")
+        self.assertEqual(p.forwarded_values({"max_tokens": 2048}), {"max_tokens": 4096})  # 고정값이 이김
+        self.assertEqual(p.forwarded_values({}), {"max_tokens": 4096})
+
+    def test_the_shipped_fallback_covers_the_longest_answer_the_servers_can_make(self):
+        """기본값은 8192 여야 한다. 4096(약 7,900자)은 KB 전문 8,000자를 아슬아슬하게 자른다.
+
+        환산은 159 실측이다: max_tokens=2048 이 21,800자를 3,970자로 잘랐다 -> 토큰당 약 1.94자.
+        """
+        self.assertEqual(P().valves.FORWARD_FALLBACK, "max_tokens=8192")
+        self.assertGreater(8192 * 1.94, 8000)                 # KB 전문이 들어간다
+
+    def test_a_fallback_key_outside_the_forward_list_is_still_sent(self):
+        """폴백에 적은 키는 FORWARD_PARAMS 목록에 없어도 나간다 -- 적은 사람이 뜻한 것이다."""
+        p = self._pipe(forward="temperature", fallback="max_tokens=8192")
+        self.assertEqual(p.forwarded_values({}), {"max_tokens": 8192})
+
+    def test_an_empty_fallback_sends_nothing(self):
+        """비우면 수정 전과 같다 -- 폴백이 강제가 되면 끌 방법이 없어진다."""
+        self.assertEqual(self._pipe(fallback="").forwarded_values({}), {})
+        self.assertEqual(self._pipe(fallback="   ").forwarded_values({}), {})
+
+    def test_a_fixed_value_wins_over_controls_and_over_an_empty_one(self):
+        p = self._pipe("max_tokens=4096")
+        self.assertEqual(p.forwarded_values({"max_tokens": 2048}), {"max_tokens": 4096})
+        self.assertEqual(p.forwarded_values({}), {"max_tokens": 4096})          # 새 채팅에도 걸린다
+
+    def test_fixed_and_controls_live_side_by_side(self):
+        p = self._pipe("max_tokens=4096")
+        self.assertEqual(p.forwarded_values({"max_tokens": 1, "temperature": 0.2}),
+                         {"max_tokens": 4096, "temperature": 0.2})
+
+    def test_values_keep_their_type(self):
+        p = self._pipe("max_tokens=4096, temperature=0.2, seed=7", forward="")
+        self.assertEqual(p.forwarded_values({}), {"max_tokens": 4096, "temperature": 0.2, "seed": 7})
+
+    def test_a_fixed_key_is_sent_even_when_the_list_leaves_it_out(self):
+        # 적은 사람이 뜻한 것이다; FORWARD_PARAMS 는 Controls 를 거르는 목록이다.
+        p = self._pipe("top_k=20", forward="max_tokens")
+        self.assertEqual(p.forwarded_values({"top_k": 99}), {"top_k": 20})
+
+    def test_a_broken_piece_is_dropped_not_raised(self):
+        p = self._pipe("max_tokens=4096, 이건=, 저건, =3", forward="")
+        self.assertEqual(p.forwarded_values({}), {"max_tokens": 4096, "이건": ""})
+
+    def test_the_payloads_own_keys_can_never_be_fixed(self):
+        p = self._pipe("model=x, messages=y, stream=false, max_tokens=4096", forward="")
+        self.assertEqual(p.forwarded_values({}), {"max_tokens": 4096})
+
+
 class TestChips(unittest.TestCase):
     def test_the_answer_list_is_copied_with_more_first(self):
         self.assertEqual(P.follow_up_chips(KB), ["나머지 보여줘",

@@ -72,3 +72,53 @@ Open WebUI 는 답이 끝나면 제목·후속 질문 칩·태그를 만들려�
 - `이어서 보려면 '나머지 보여줘'`, `나머지 N개는 …` 같은 안내 줄은 본문에 남는다(칩의 맨 앞 "나머지 보여줘" 도 그대로).
 - 기억은 파이프 프로세스 메모리라 Open WebUI 를 다시 띄우면 그 전 답의 칩은 다시 만들어지지 않는다(새 답부터 정상).
 - `brcm-setup ask --webui` 의 결과 파일에도 목록이 빠진다. 목록까지 보려면 Valve 를 잠시 끄거나 tool 모드(`brcm-setup ask <tool>`)로 본다.
+
+## `static/custom.css` (159 화면 손질)
+
+마크다운으로는 열 폭도 그림 크기도 적을 방법이 없어서, 그 둘만 화면 쪽 CSS 로 둔다.
+현재 두 규칙이다 — 간트 차트를 답변 영역 폭에 맞춤(BRCM-MCP #304), 두 열 표의 첫 열을
+30% 로(#282). 왜 그렇게 했는지와 실측값은 파일 안 주석에 있다.
+
+**159 는 k8s 다**(namespace `open-webui`, **StatefulSet** `open-webui`, 파드 `open-webui-0`).
+진입 HTML 은 `app.html` 이 아니라 **`/app/build/index.html`** 이고, 그것이
+`/static/custom.css` 를 참조한다.
+
+**`custom.css` 는 파드 안에 두 군데 있고, 서빙되는 것은 백엔드 쪽이다**(2026-11-05
+실측, 여기서 한 번 틀렸다):
+
+```
+/app/backend/open_webui/static/custom.css   <= 이것이 /static/custom.css 로 나간다
+/app/build/static/custom.css                <= 프론트 빌드 산출물. 넣어도 아무 일이 없다
+```
+
+`main.py` 의 `app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')`
+가 그렇게 한다. 빌드 쪽에 3,362바이트를 넣었는데
+`curl localhost:8080/static/custom.css` 가 `status=200 bytes=0` 을 돌려주어
+알았다 — 브라우저 캐시도 서비스 워커도 아니었고, 시크릿 창에서도 똑같이 안 먹었다.
+
+시험(파드가 재시작되면 사라진다):
+
+```bash
+kubectl -n open-webui cp static/custom.css \
+    open-webui-0:/app/backend/open_webui/static/custom.css
+kubectl -n open-webui exec open-webui-0 -c open-webui -- \
+    curl -s -o /dev/null -w '%{http_code} %{size_download}\n' \
+    http://127.0.0.1:8080/static/custom.css      # 200 3362 이어야 한다
+```
+
+영구(ConfigMap 을 `subPath` 로 그 파일 위에 마운트):
+
+```bash
+kubectl -n open-webui create configmap brcm-custom-css     --from-file=custom.css=static/custom.css --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n open-webui rollout restart statefulset/open-webui
+```
+
+`subPath` 마운트는 ConfigMap 을 고쳐도 자동 반영되지 않는다 — 바꿀 때마다
+`create configmap … | kubectl apply` 뒤 `rollout restart` 다. 되돌리기는 마운트를
+빼고 `rollout restart` 한다.
+
+적용 뒤 브라우저를 **강력 새로고침**해야 보인다. 파일 이름은 그대로 두어야 한다 —
+`index.html` 이 그 경로를 참조한다.
+
+159 는 다시 올릴 때가 있다. 그때 이 파일이 파드 안에만 있으면 조용히 사라지므로
+저장소에 둔다.

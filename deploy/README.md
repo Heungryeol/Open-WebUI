@@ -9,7 +9,7 @@
 | 항목 | 지금(159) | 올린 뒤 | 근거 |
 |---|---|---|---|
 | 이미지 | `sup-harbor…/open-webui/open-webui:main` (= 0.10.2, `IfNotPresent`) | `…:v0.13.3` 태그를 **박아서** | `main` 태그를 다시 밀어도 노드가 캐시한 옛 이미지를 씀 |
-| 헬름 차트 | `open-webui-15.2.0` (appVersion 0.10.2) | **`18.0.0`** (appVersion 0.13.0) + `image.tag=v0.13.3` | 0.13.3 을 담은 차트 릴리스는 아직 없다. 15.2.0↔18.0.0 values 키 차이는 추가 2개(`copyAppData.resources`, `route.timeouts`)뿐 — **`owui-value.yaml` 을 고칠 것이 없다** |
+| 헬름 차트 | `open-webui-15.2.0` (appVersion 0.10.2) | **`18.0.0`** (appVersion 0.13.0) + `image.tag=v0.13.3` | 0.13.3 을 담은 차트 릴리스는 아직 없다. 15.2.0↔18.0.0 values 키 차이는 추가 2개(`pipelines.resources`, `route.timeouts`)뿐 — **`owui-value.yaml` 을 고칠 것이 없다** |
 | values | `owui-value.yaml` | 지금 릴리스의 values(`helm get values`) + 우리 것 3가지 | 아래 `03-make-values.py` |
 | Authentik OIDC | `sso.oidc.*`, CA ConfigMap, `REQUESTS_CA_BUNDLE`… | 그대로 | 환경변수 이름 전부 유지(0.13.3 `config.py`) |
 | PAIS 파이프 함수 | DB 에 저장 | 그대로 — DB 마이그레이션이 옮김 | 파이프 호출 규약(`__task__`·`__task_body__`·`__metadata__`, `follow_up_generation`, Advanced Params 전달) 0.13.3 과 같음 |

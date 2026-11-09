@@ -1,6 +1,14 @@
 # Open-WebUI
 
-Open WebUI 에 올려 쓰는 Function 코드 보관소.
+Open WebUI 에 올려 쓰는 Function 코드 보관소 — 와 그것을 **air-gap 에서 올리고 업그레이드하는 패키지**(`deploy/`).
+
+| 디렉터리 | 무엇 |
+|---|---|
+| `functions/` | PAIS Multi-Agent Pipe (아래) |
+| `static/custom.css` | 159 화면 손질(아래) |
+| `scripts/update_function.py` | 파이프를 API 로 Open WebUI 에 밀어 넣기 |
+| `deploy/` | **0.10.2 → 0.13.3 업그레이드 절차와 반입 패키지** — `deploy/README.md` 부터. 인터넷 PC 의 `bundle/make_bundle.sh`, bastion 의 `bastion/01~06` |
+| `tests/` | 파이프·values 합치기 단위 시험 (`python3 -m unittest discover -s tests`) |
 
 ## functions/pais_multi_agent_pipe.py
 

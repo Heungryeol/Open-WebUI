@@ -289,5 +289,111 @@ class TestTasks(unittest.TestCase):
         self.assertIsNone(P().local_task("", {"metadata": None}, None))
 
 
+SPACE = """esx09-datastore-bay8: 전체 3577 GB 중 3431 GB 사용(95.9%), 남은 146 GB.
+
+| VM | 사용량(GB) | 할당 용량(GB) | 전원 |
+|---|---|---|---|
+| 261018-esx09-vcf911-esx-01a | 932 GB | 1060 GB | poweredOn |
+| 261018-esx09-vcf911-esx-02a | 916 GB | 1060 GB | poweredOn |
+
+```mermaid
+pie showData
+  title 『 esx09-datastore-bay8 공간 구성(GB) 』
+  "261018-esx09-vcf911-esx-01a" : 932
+  "여유" : 146
+```
+"""
+DFW = """'sc-fill01' 와 'sc-mig01' 에 걸리는 분산 방화벽 규칙 5개 (L3 의 DROP/REJECT 1개)
+
+| category | policy | seq | rule | source | destination | services | action | hits |
+|---|---|---|---|---|---|---|---|---|
+| Application | sc-showcase | 10 | sc-deny-http | sc-mig01 | sc-fill01 | HTTP | REJECT | - |
+"""
+
+
+def chat(*turns):
+    """user, assistant, user, ... -> the messages Open WebUI sends."""
+    return [{"role": "assistant" if i % 2 else "user", "content": t} for i, t in enumerate(turns)]
+
+
+class TestEarlierDataIsNotLeftToCopy(unittest.TestCase):
+    """159, 2026-11-10: an eleven-turn chat replayed through the agent. Turn 5 ("… 용량을 가장 많이
+    차지하고 있는 개체는?") and turn 9 ("DFW 룰 확인해줘") made no tool call -- the gateway journal has
+    no CALL line for either -- and answered with tables: 1,250/1,100/500/579 GB where vCenter had
+    just said 932/916/898/684, and four rules named sc-allow-all that NSX does not have. Both
+    tables used the header row of the answer before them."""
+
+    def setUp(self):
+        self.pipe = P()
+
+    def shaped(self, *turns):
+        return self.pipe._shape_history(chat(*turns))
+
+    def test_the_question_after_a_table_is_told_the_values_are_gone(self):
+        for question in ("esx09-datastore-bay8 데이터스토어 용량을 가장 많이 차지하고 있는 개체는?",
+                         "DFW 룰 확인해줘", "sc-fill01 VM 통신 문제가 있어"):
+            out = self.shaped("esx09-datastore-bay8 데이터스토어 용량이 부족한 이유는?", SPACE, question)
+            self.assertEqual(out[-1]["content"], f"{question}\n{P._STALE_HINT}", question)
+
+    def test_an_earlier_chart_block_goes_with_its_numbers(self):
+        sent = self.shaped("용량이 부족한 이유는?", SPACE, "DFW 룰 확인해줘")[1]["content"]
+        self.assertNotIn("mermaid", sent)
+        self.assertNotIn(": 932", sent)
+        self.assertIn(P._CHART_STUB, sent)
+        # A chart-only answer ("… 원형 그래프로 그려줘") has no table row to trigger on.
+        only = "```mermaid\npie showData\n  \"a\" : 1\n```"
+        out = self.shaped("원형 그래프로 그려줘", only, "esx09 상태는?")
+        self.assertEqual(out[1]["content"], P._CHART_STUB)
+        self.assertTrue(out[-1]["content"].endswith(P._STALE_HINT))
+
+    def test_a_chart_cut_before_its_closing_fence_goes_too(self):
+        sent = self.shaped("q", "앞 문장\n```mermaid\npie showData\n  \"a\" : 932", "다른 질문이야")[1]["content"]
+        self.assertEqual(sent, "앞 문장\n" + P._CHART_STUB)
+
+    def test_the_header_row_is_not_left_as_a_template(self):
+        sent = self.shaped("두 VM 통신 확인", DFW, "DFW 룰 확인해줘")[1]["content"]
+        self.assertNotIn("| category | policy |", sent)
+        self.assertIn("(표 1행 생략 — 첫 열: Application; 지금 값은 도구로 다시 조회)", sent)
+        self.assertIn("분산 방화벽 규칙 5개", sent)            # the sentence around the table stays
+        self.pipe.valves.KEEP_TABLE_HEADER = True
+        self.assertIn("| category | policy |", self.shaped("두 VM 통신 확인", DFW, "DFW 룰 확인해줘")[1]["content"])
+
+    def test_a_kb_answer_counts_as_data_left_out(self):
+        out = self.shaped("vMotion 실패 KB", KB, "kr-mgmt-cl01 vMotion VMkernel MTU 보여줘")
+        self.assertTrue(out[-1]["content"].endswith(P._STALE_HINT))
+
+    def test_no_line_when_nothing_was_left_out(self):
+        self.assertEqual(self.shaped("esx09 상태는?")[-1]["content"], "esx09 상태는?")
+        out = self.shaped("안녕", "안녕하세요. 무엇을 도와드릴까요?", "esx09 상태는?")
+        self.assertEqual(out[-1]["content"], "esx09 상태는?")
+
+    def test_thanks_and_greetings_get_no_line(self):
+        # A hint on a greeting made the model call a tool for it (2nd QA M-B).
+        for word in ("고마워", "감사합니다", "네 알겠습니다"):
+            self.assertEqual(self.shaped("q", SPACE, word)[-1]["content"], word, word)
+
+    def test_one_hint_per_message(self):
+        paging = self.shaped("q", SPACE, "나머지 보여줘")[-1]["content"]
+        self.assertNotIn(P._STALE_HINT, paging)
+        same = self.shaped("esx09 데이터스토어 용량 보여줘", SPACE, "esx09 데이터스토어 용량 보여줘")[-1]["content"]
+        self.assertIn(P._SAME_QUESTION, same)
+        self.assertNotIn(P._STALE_HINT, same)
+        how = self.shaped("q", SPACE, "esx09 데이터스토어 용량 늘리는 방법 알려줘")[-1]["content"]
+        self.assertIn(P._TOOL_HINT, how)
+        self.assertNotIn(P._STALE_HINT, how)
+        short = self.shaped("계정 잠김", SPACE, "잠금 해제")[-1]["content"]
+        self.assertIn("앞 질문", short)
+        self.assertNotIn(P._STALE_HINT, short)
+
+    def test_the_valve_turns_it_off(self):
+        self.pipe.valves.STALE_DATA_HINT = False
+        self.assertEqual(self.shaped("q", SPACE, "DFW 룰 확인해줘")[-1]["content"], "DFW 룰 확인해줘")
+
+    def test_full_history_is_untouched(self):
+        self.pipe.valves.HISTORY_MODE = "full"
+        messages = chat("q", SPACE, "DFW 룰 확인해줘")
+        self.assertIs(self.pipe._shape_history(messages), messages)
+
+
 if __name__ == "__main__":
     unittest.main()

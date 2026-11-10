@@ -157,6 +157,23 @@ class Pipe:
             default=True,
             description="해결·방법 질문이나 영어 오류 문구가 든 질문에 '도구(KB 검색)로 답함' 한 줄을 붙임.",
         )
+        # Two answers in one chat were tables no tool returned (159, 11-10 replay of an eleven-turn
+        # chat, no CALL line in the gateway journal for either): "… 용량을 가장 많이 차지하고 있는
+        # 개체는?" got 1,250/1,100/500/579 GB where vCenter says 932/916/898/684, and "DFW 룰
+        # 확인해줘" got rules named sc-allow-all that NSX does not have. Both reused the header row
+        # the earlier answer's table had left behind, and neither question carried any hint: one
+        # names its own subject, the other holds a Latin word, so FOLLOWUP_HINT skipped both.
+        STALE_DATA_HINT: bool = Field(
+            default=True,
+            description=(
+                "앞 답의 표·차트·KB 를 줄여 보낸 채팅에서, 다른 힌트가 붙지 않은 질문에 "
+                "'앞 답의 표와 수치는 남아 있지 않음 — 도구로 받은 것만 답함' 한 줄을 붙임."
+            ),
+        )
+        KEEP_TABLE_HEADER: bool = Field(
+            default=False,
+            description="STRIP_TABLES 에서 앞 답 표의 머리 줄을 남김(11-10 이전 동작). 끄면 '(표 N행 생략 …)' 한 줄만 남음.",
+        )
         FOLLOWUP_HINT: bool = Field(
             default=True,
             description="짧은 후속 질문('잠금 해제 방법' 등)에 앞 질문을 붙여 도구 호출을 유도.",
@@ -349,6 +366,14 @@ class Pipe:
     _ANSWER_STUB = "(이전 답 — 본문 생략)"
     _TABLE_ROWS = "(표 {n}행 생략 — 첫 열: {names}; 지금 값은 도구로 다시 조회)"
     _SAME_QUESTION = "(같은 질문: 값이 바뀌었을 수 있으니 도구를 다시 호출)"
+    # The gateway's pie and gantt carry the table's numbers a second time ('"<vm>" : 932').
+    _CHART = r"```mermaid\b.*?(?:```|\Z)"
+    _CHART_STUB = "(차트 생략 — 지금 값은 도구로 다시 조회)"
+    # Declarative like the other hints: it says what this chat holds, and the model draws the call.
+    _STALE_HINT = (
+        "(앞 답의 표와 수치는 이 대화에 남아 있지 않음: 값·목록·규칙은 이번에 도구를 호출해 받은 것만 답함. "
+        "기억으로 표를 다시 만들지 않음)"
+    )
     # Names no tool: an Operations alert name ("Datastore is running out of disk space 조치
     # 방법은?") is Operations' to answer, a log phrase the log tool's (3rd QA M4).
     _TOOL_HINT = (
@@ -476,16 +501,19 @@ class Pipe:
         return re.sub(r"(?:주세요|줘요|줘|요)$", "", bare)
 
     @classmethod
-    def _compact_tables(cls, text: str, table_mark) -> str:
-        """Each markdown table keeps its header row; its data rows become one line naming up to
-        eight first-column values. QA on 81b561b: replacing the whole answer lost what "그 호스트
-        로그 보여줘" points at; the values themselves stay out so there is nothing to copy."""
+    def _compact_tables(cls, text: str, table_mark, keep_header: bool = True) -> str:
+        """Each markdown table becomes one line naming up to eight first-column values. QA on
+        81b561b: replacing the whole answer lost what "그 호스트 로그 보여줘" points at; the values
+        themselves stay out so there is nothing to copy. The header row went too on 11-10
+        (keep_header=False from the valve): a nine-column DFW header left in view came back as a
+        nine-column table of rules nobody had fetched."""
         lines = text.split("\n")
         out, i = [], 0
         while i < len(lines):
             # Leading pipes are optional in markdown ("a | b" over "---|---").
             if i + 1 < len(lines) and "|" in lines[i] and table_mark.match(lines[i + 1]):
-                out.append(lines[i])
+                if keep_header:
+                    out.append(lines[i])
                 i += 2
                 firsts = []
                 while i < len(lines) and "|" in lines[i] and lines[i].strip():
@@ -611,6 +639,9 @@ class Pipe:
         # A markdown table's separator row: "|---|---|", "| :--- | ---: |".
         table_mark = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*\|", re.M)
         shaped = []
+        # True once an earlier answer went out without its data: from then on the model holds
+        # the question and the names but none of the values.
+        data_left_out = False
         for m in earlier:
             if m.get("role") != "assistant":
                 shaped.append(m)
@@ -620,14 +651,21 @@ class Pipe:
                 if kb_mark.search(text):
                     tool = "nsx_query" if re.search(r"\bNSX\b", text) else "vcenter_query"
                     stub = self._KB_STUB.format(tool=tool)
+                    data_left_out = True
                 else:
                     stub = self._ANSWER_STUB
                 shaped.append({"role": "assistant", "content": stub})
             else:
+                if self.valves.STRIP_TABLES and re.search(self._CHART, text, re.S):
+                    # Before the tables: a chart block has no "|---|" row and its numbers
+                    # were still in view after the table beside it had gone.
+                    text = re.sub(self._CHART, self._CHART_STUB, text, flags=re.S)
+                    data_left_out = True
                 if self.valves.STRIP_TABLES and table_mark.search(text):
                     # Declarative, like the KB stub: values in an old table are stale
                     # by the next question, and a table in view was copied or extended.
-                    text = self._compact_tables(text, table_mark)
+                    text = self._compact_tables(text, table_mark, bool(self.valves.KEEP_TABLE_HEADER))
+                    data_left_out = True
                 limit = max(0, int(self.valves.KEEP_ANSWER_CHARS))
                 cut = text if len(text) <= limit else text[:limit] + " …(생략)"
                 shaped.append({"role": "assistant", "content": cut})
@@ -728,6 +766,15 @@ class Pipe:
             and self._needs_tool(self._drop_greeting(bare))
         ):
             current = {"role": "user", "content": f"{cur_text}\n{self._TOOL_HINT}"}
+        if (
+            self.valves.STALE_DATA_HINT
+            and data_left_out
+            and not is_paging
+            # One hint per message, and the last in line: the others name the call to make.
+            and current is plain
+            and not self._is_chit_chat(bare)
+        ):
+            current = {"role": "user", "content": f"{cur_text}\n{self._STALE_HINT}"}
         return system + shaped + [current]
 
     # ------------------------------------------------------------------

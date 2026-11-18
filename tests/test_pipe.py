@@ -276,6 +276,85 @@ class TestHiddenList(unittest.TestCase):
         self.assertIsNone(p._hiding({"chat_id": "c"}))
 
 
+class Chunks:
+    """An SSE response given chunk by chunk (finish_reason, reasoning)."""
+
+    def __init__(self, *chunks):
+        self.chunks = chunks
+
+    def iter_lines(self):
+        for c in self.chunks:
+            yield "data: " + json.dumps({"choices": [c]})
+        yield "data: [DONE]"
+
+    def close(self):
+        pass
+
+
+class TestEmptyAnswer(unittest.TestCase):
+    """159 2026-11-18: three tool calls, 180 s of stream, no text -- an empty bubble."""
+
+    def test_an_answer_with_no_text_says_so_and_why(self):
+        p = P()
+        out = "".join(p.stream_generator(Chunks(
+            {"delta": {"reasoning_content": "x" * 40}}, {"delta": {}, "finish_reason": "length"})))
+        self.assertTrue(out.startswith("\n\n"))
+        self.assertIn("답을 받지 못했습니다", out)
+        self.assertIn("max_tokens", out)
+        self.assertIn("40자", out)
+
+    def test_another_end_names_its_reason(self):
+        out = "".join(P().stream_generator(Chunks({"delta": {"content": "  \n"}, "finish_reason": "stop"})))
+        self.assertIn("finish_reason=stop", out)
+
+    def test_an_answer_with_text_is_untouched(self):
+        out = "".join(P().stream_generator(Chunks({"delta": {"content": "알림 3건"}, "finish_reason": "stop"})))
+        self.assertEqual(out, "알림 3건")
+
+    def test_no_reasoning_field_is_not_zero_thought(self):
+        out = "".join(P().stream_generator(Chunks({"delta": {}, "finish_reason": "length"})))
+        self.assertIn("생각 글자 수는 받지 못함", out)
+        self.assertNotIn("생각 0자", out)
+
+    def test_a_null_reasoning_field_is_not_zero_thought(self):
+        out = "".join(P().stream_generator(Chunks(
+            {"delta": {"content": "", "reasoning_content": None}}, {"delta": {}, "finish_reason": "length"})))
+        self.assertIn("생각 글자 수는 받지 못함", out)
+
+    def test_whitespace_sent_does_not_make_the_notice_a_code_block(self):
+        out = "".join(P().stream_generator(Chunks({"delta": {"content": "    "}, "finish_reason": "stop"})))
+        self.assertIn("    \n\n답을 받지 못했습니다", out)
+
+    def test_text_left_only_in_the_filters_tail_counts(self):
+        p = P()
+        # No newline at the end: the filter holds the last line until flush.
+        out = "".join(p.stream_generator(Stream("요약입니다"), None, "c8"))
+        self.assertEqual(out, "요약입니다")
+
+    def test_the_non_stream_answer_too(self):
+        class Resp:
+            status_code = 200
+            def json(self):
+                return {"choices": [{"message": {"content": "", "reasoning_content": "abc"}, "finish_reason": "length"}]}
+            def close(self):
+                pass
+        p = P()
+        p.valves.LOCAL_TASKS = False
+        p.get_assistant = lambda _id: {"id": "a1"}
+        p._get_access_token = lambda force_refresh=False: "t"
+        p.get_base_url = lambda: "http://x"
+        p._get_http_client = lambda: types.SimpleNamespace(
+            build_request=lambda *a, **k: None, send=lambda *a, **k: Resp())
+        out = p.pipe({"model": "pipe.a1", "stream": False, "messages": [{"role": "user", "content": "q"}]})
+        self.assertIn("max_tokens", out)
+        self.assertIn("생각 3자", out)
+
+    def test_only_a_hidden_list_still_counts_as_text_shown(self):
+        p = P()
+        out = "".join(p.stream_generator(Stream("이어서 물어볼 만한 것:\n- esx10 보여줘\n"), None, "c9"))
+        self.assertIn("답을 받지 못했습니다", out)  # nothing visible reached the chat
+
+
 class TestTasks(unittest.TestCase):
     def test_tasks_never_reach_pais(self):
         p = P()

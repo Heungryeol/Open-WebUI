@@ -484,7 +484,7 @@ class Pipe:
     _QLABEL = r"^\s*[Qq]\d+[.):]?\s*"
     # "나머지 보여줘" and its variants; a sentence with more in it is a new question.
     _PAGING = (
-        r"(?:나머지|다음|더|계속)\s*(?:도|를|은)?\s*(?:페이지|거|것)?\s*(?:도|를)?\s*"
+        r"(?:나머지|다음|더|계속|이어서)\s*(?:도|를|은|는)?\s*(?:페이지|거|것)?\s*(?:도|를)?\s*"
         r"(?:보여\s*줘|보여\s*주세요|보여\s*줄래|알려\s*줘|알려\s*주세요|줘|주세요|보기|해\s*줘)?[.!?]?"
         r"|more|next(?:\s*page)?|continue"
     )
@@ -689,8 +689,19 @@ class Pipe:
                     hit = re.search(r"(vcenter_query|nsx_query|ops_query|logs_query)", m.get("content", ""))
                     prev_tool = hit.group(1) if hit else None
                     break
-            hint = f"{prev_tool or '바로 앞 답의 도구'} 를 request=\"나머지 보여줘\" 로 호출"
-            current = {"role": "user", "content": f"{cur_text}\n({hint})"}
+            # "나머지 보여줘" after a few stripped answers was answered with no tool call, in the shape of those answers: a
+            # head line, "(표 31행 생략 — 첫 열: …; 지금 값은 도구로 다시 조회)" with counts the model made up, and no CALL in
+            # the gateway journal (159 BRCM-MCP #728, 11-18: three of three after a gantt in a ten-question chat, while
+            # the same flow in a fresh chat called the tool every time) -- an earlier stripped turn in view is an example
+            # of answering one without a tool. The gateway, not the model, keeps which list goes on (Turn.last_product
+            # and the products' paging), so the turn goes alone. No valve on purpose: a new valve can empty the saved
+            # ones when the code is replaced (README, 10-22); HISTORY_MODE=full gives the whole chat as before.
+            # "그 결과만 답함" alone was read as "sum it up": 159 11-18 the rest's gantt block and head line were dropped and a sentence of
+            # the model's own ("vCenter에서 발생한 …" for Operations alerts) took their place. Say what to keep.
+            hint = (f"{prev_tool or '앞 답을 낸 도구(모르면 vcenter_query)'} 를 request=\"나머지 보여줘\" 로 한 번 호출하고 "
+                    "그 답을 고치지 않고 그대로 옮김(첫 줄, ``` 차트 블록, 표, 끝 줄 모두) -- 앞 답은 이 대화에 없음, "
+                    "어느 목록을 이을지는 서버가 앎")
+            return system + [{"role": "user", "content": f"{cur_text}\n({hint})"}]
         elif (
             self.valves.FOLLOWUP_HINT
             and len(bare) <= int(self.valves.FOLLOWUP_MAX_CHARS)
@@ -1214,7 +1225,16 @@ class Pipe:
             else:
                 data = response.json()
                 response.close()
-                return self.strip_next_list(data["choices"][0]["message"]["content"], hide)
+                choice = (data.get("choices") or [{}])[0]
+                text = (choice.get("message") or {}).get("content") or ""
+                if not text.strip():
+                    message = choice.get("message") or {}
+                    said = [k for k in ("reasoning_content", "reasoning") if message.get(k) is not None]
+                    thought = sum(len(message.get(k) or "") for k in said) if said else None
+                    logger.warning(f"pais pipe: empty answer (finish_reason={choice.get('finish_reason')}, "
+                                   f"reasoning {'not sent' if thought is None else f'{thought} chars'})")
+                    return self.empty_answer(choice.get("finish_reason"), thought)
+                return self.strip_next_list(text, hide)
 
         except httpx.TimeoutException as e:
             return (
@@ -1227,6 +1247,17 @@ class Pipe:
             logger.error(f"예상치 못한 오류: {e}")
             return f"Error: 예상치 못한 오류가 발생했습니다: {str(e)}"
 
+    @staticmethod
+    def empty_answer(finish: Optional[str], thought: Optional[int] = None) -> str:
+        """What the chat shows when PAIS ended the answer without a word of visible text.
+        `thought` is None when no reasoning field ever came: 0 would read as "it did not think"."""
+        seen = "생각 글자 수는 받지 못함" if thought is None else f"생각 {thought}자"
+        why = (f"모델이 답을 쓰기 전에 출력 한도(max_tokens)에 닿았습니다({seen})" if finish == "length"
+               else f"모델이 보이는 글 없이 답을 끝냈습니다(finish_reason={finish or '없음'}, {seen})")
+        # Leading blank lines: whitespace the model did send must not turn this into a code block.
+        return (f"\n\n답을 받지 못했습니다 -- {why}. 도구가 읽은 값은 있었을 수 있지만 화면에 옮겨지지 않았습니다. "
+                "같은 질문을 다시 보내거나, 대상을 하나로 좁혀 다시 물어보세요.")
+
     def stream_generator(self, response, __event_emitter__=None, hide: Optional[str] = None):
         """SSE(data: {...}) 스트림을 파싱해서 delta content만 순차적으로 yield한다.
         공용 persistent client는 여기서 닫지 않고 response만 닫아 커넥션(keep-alive)을
@@ -1234,6 +1265,9 @@ class Pipe:
         import json
 
         filt = self._NextListFilter(self._HEAD, self._ITEM, self._OFFER_HEAD, self._QUOTED_ITEM) if hide else None
+        # 159 2026-11-18 23:14: a three-tool answer streamed for 180 s and ended with no text at all,
+        # so the chat showed an empty bubble and nothing said why. Count what came, and say so.
+        wrote, finish, thought = False, None, None
         try:
             for line in response.iter_lines():
                 if not line:
@@ -1255,20 +1289,32 @@ class Pipe:
                 if not choices:
                     continue
 
-                delta = choices[0].get("delta", {})
+                finish = choices[0].get("finish_reason") or finish
+                delta = choices[0].get("delta") or {}
+                for key in ("reasoning_content", "reasoning"):
+                    if delta.get(key) is not None:  # vLLM-style servers send null when nothing came
+                        thought = (thought or 0) + len(delta.get(key) or "")
                 content = delta.get("content")
                 if content:
                     if filt is not None:
                         content = filt.feed(content)
                     if content:
+                        wrote = wrote or bool(content.strip())
                         yield content
 
             if filt is not None:
                 tail = filt.flush()
                 if tail:
+                    wrote = wrote or bool(tail.strip())
                     yield tail
                 self._remember(hide, filt.items)
                 filt = None  # remembered; the finally below must not forget it
+            if not wrote:
+                hidden = len(self._next_lists.get(hide) or []) if hide else 0
+                logger.warning(f"pais pipe: empty answer (finish_reason={finish}, "
+                               f"reasoning {'not sent' if thought is None else f'{thought} chars'}, "
+                               f"hidden next-list items {hidden})")
+                yield self.empty_answer(finish, thought)
 
         except Exception as e:
             logger.error(f"스트리밍 처리 중 오류: {e}")

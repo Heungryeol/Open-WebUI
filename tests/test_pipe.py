@@ -276,6 +276,85 @@ class TestHiddenList(unittest.TestCase):
         self.assertIsNone(p._hiding({"chat_id": "c"}))
 
 
+class Chunks:
+    """An SSE response given chunk by chunk (finish_reason, reasoning)."""
+
+    def __init__(self, *chunks):
+        self.chunks = chunks
+
+    def iter_lines(self):
+        for c in self.chunks:
+            yield "data: " + json.dumps({"choices": [c]})
+        yield "data: [DONE]"
+
+    def close(self):
+        pass
+
+
+class TestEmptyAnswer(unittest.TestCase):
+    """159 2026-11-18: three tool calls, 180 s of stream, no text -- an empty bubble."""
+
+    def test_an_answer_with_no_text_says_so_and_why(self):
+        p = P()
+        out = "".join(p.stream_generator(Chunks(
+            {"delta": {"reasoning_content": "x" * 40}}, {"delta": {}, "finish_reason": "length"})))
+        self.assertTrue(out.startswith("\n\n"))
+        self.assertIn("답을 받지 못했습니다", out)
+        self.assertIn("max_tokens", out)
+        self.assertIn("40자", out)
+
+    def test_another_end_names_its_reason(self):
+        out = "".join(P().stream_generator(Chunks({"delta": {"content": "  \n"}, "finish_reason": "stop"})))
+        self.assertIn("finish_reason=stop", out)
+
+    def test_an_answer_with_text_is_untouched(self):
+        out = "".join(P().stream_generator(Chunks({"delta": {"content": "알림 3건"}, "finish_reason": "stop"})))
+        self.assertEqual(out, "알림 3건")
+
+    def test_no_reasoning_field_is_not_zero_thought(self):
+        out = "".join(P().stream_generator(Chunks({"delta": {}, "finish_reason": "length"})))
+        self.assertIn("생각 글자 수는 받지 못함", out)
+        self.assertNotIn("생각 0자", out)
+
+    def test_a_null_reasoning_field_is_not_zero_thought(self):
+        out = "".join(P().stream_generator(Chunks(
+            {"delta": {"content": "", "reasoning_content": None}}, {"delta": {}, "finish_reason": "length"})))
+        self.assertIn("생각 글자 수는 받지 못함", out)
+
+    def test_whitespace_sent_does_not_make_the_notice_a_code_block(self):
+        out = "".join(P().stream_generator(Chunks({"delta": {"content": "    "}, "finish_reason": "stop"})))
+        self.assertIn("    \n\n답을 받지 못했습니다", out)
+
+    def test_text_left_only_in_the_filters_tail_counts(self):
+        p = P()
+        # No newline at the end: the filter holds the last line until flush.
+        out = "".join(p.stream_generator(Stream("요약입니다"), None, "c8"))
+        self.assertEqual(out, "요약입니다")
+
+    def test_the_non_stream_answer_too(self):
+        class Resp:
+            status_code = 200
+            def json(self):
+                return {"choices": [{"message": {"content": "", "reasoning_content": "abc"}, "finish_reason": "length"}]}
+            def close(self):
+                pass
+        p = P()
+        p.valves.LOCAL_TASKS = False
+        p.get_assistant = lambda _id: {"id": "a1"}
+        p._get_access_token = lambda force_refresh=False: "t"
+        p.get_base_url = lambda: "http://x"
+        p._get_http_client = lambda: types.SimpleNamespace(
+            build_request=lambda *a, **k: None, send=lambda *a, **k: Resp())
+        out = p.pipe({"model": "pipe.a1", "stream": False, "messages": [{"role": "user", "content": "q"}]})
+        self.assertIn("max_tokens", out)
+        self.assertIn("생각 3자", out)
+
+    def test_only_a_hidden_list_still_counts_as_text_shown(self):
+        p = P()
+        out = "".join(p.stream_generator(Stream("이어서 물어볼 만한 것:\n- esx10 보여줘\n"), None, "c9"))
+        self.assertIn("답을 받지 못했습니다", out)  # nothing visible reached the chat
+
+
 class TestTasks(unittest.TestCase):
     def test_tasks_never_reach_pais(self):
         p = P()
@@ -392,6 +471,45 @@ class TestEarlierDataIsNotLeftToCopy(unittest.TestCase):
     def test_full_history_is_untouched(self):
         self.pipe.valves.HISTORY_MODE = "full"
         messages = chat("q", SPACE, "DFW 룰 확인해줘")
+        self.assertIs(self.pipe._shape_history(messages), messages)
+
+
+class TestPagingGoesAlone(unittest.TestCase):
+    """159 BRCM-MCP #728, 11-18: in a ten-question chat "나머지 보여줘" after a gantt got no tool call three times out of
+    three -- no CALL in the gateway journal -- and the answer copied the stripped turns before it: a head line and
+    "(표 31행 생략 — 첫 열: …; 지금 값은 도구로 다시 조회)" with made-up counts. The same flow in a fresh chat called the tool."""
+
+    GANTT = "**VCF Operations** 에서 조회한 결과입니다.\n\n```mermaid\ngantt\n  title x\n```\n\n" + SPACE
+
+    def setUp(self):
+        self.pipe = P()
+
+    def test_a_paging_turn_is_sent_without_the_chat_before_it(self):
+        system = {"role": "system", "content": "s"}
+        out = self.pipe._shape_history([system] + chat("VM 목록 보여줘", SPACE, "나머지 보여줘", SPACE,
+                                                       "진행 중 알림 간트 차트로 그려줘", self.GANTT, "나머지 보여줘"))
+        self.assertEqual(out[0], system)
+        self.assertEqual(len(out), 2)
+        sent = out[-1]["content"]
+        self.assertTrue(sent.startswith("나머지 보여줘\n("))
+        self.assertIn('request="나머지 보여줘"', sent)
+        self.assertIn("한 번 호출", sent)
+        self.assertIn("그대로 옮김", sent)
+        self.assertIn("차트 블록", sent)
+        self.assertNotIn("행 생략", sent)
+
+    def test_every_paging_spelling_goes_alone(self):
+        for word in ("나머지도 보여줘", "나머지는?", "이어서 보여줘", "다음 페이지", "계속", "더 보여주세요", "more", "next page"):
+            out = self.pipe._shape_history(chat("q", SPACE, word))
+            self.assertEqual(len(out), 1, word)
+
+    def test_a_new_question_keeps_its_history(self):
+        for word in ("나머지 VM 중 꺼진 것만 보여줘", "더 자세히 보여줘", "다음 단계는?", "계속 실패해", "이어서 설명해줘"):
+            self.assertEqual(len(self.pipe._shape_history(chat("q", SPACE, word))), 3, word)
+
+    def test_full_history_mode_keeps_the_whole_chat(self):
+        self.pipe.valves.HISTORY_MODE = "full"
+        messages = chat("q", SPACE, "나머지 보여줘")
         self.assertIs(self.pipe._shape_history(messages), messages)
 
 

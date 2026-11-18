@@ -1228,8 +1228,12 @@ class Pipe:
                 choice = (data.get("choices") or [{}])[0]
                 text = (choice.get("message") or {}).get("content") or ""
                 if not text.strip():
-                    logger.warning(f"pais pipe: empty answer (finish_reason={choice.get('finish_reason')})")
-                    return self.empty_answer(choice.get("finish_reason"))
+                    message = choice.get("message") or {}
+                    said = [k for k in ("reasoning_content", "reasoning") if k in message]
+                    thought = sum(len(message.get(k) or "") for k in said) if said else None
+                    logger.warning(f"pais pipe: empty answer (finish_reason={choice.get('finish_reason')}, "
+                                   f"reasoning {'not sent' if thought is None else f'{thought} chars'})")
+                    return self.empty_answer(choice.get("finish_reason"), thought)
                 return self.strip_next_list(text, hide)
 
         except httpx.TimeoutException as e:
@@ -1244,12 +1248,15 @@ class Pipe:
             return f"Error: 예상치 못한 오류가 발생했습니다: {str(e)}"
 
     @staticmethod
-    def empty_answer(finish: Optional[str], thought: int = 0) -> str:
-        """What the chat shows when PAIS ended the answer without a word of text."""
-        why = (f"모델이 답을 쓰기 전에 출력 한도(max_tokens)에 닿았습니다(생각 {thought}자)" if finish == "length"
-               else f"모델이 빈 답으로 끝냈습니다(finish_reason={finish or '없음'}, 생각 {thought}자)")
-        return (f"답을 받지 못했습니다 -- {why}. 도구가 읽은 값은 있었을 수 있지만 화면에 옮겨지지 않았습니다. "
-                "같은 질문을 다시 보내거나, 대상을 하나로 좁혀 물어보세요(예: 인프라 이름 + \"주요 이슈 정리해줘\").")
+    def empty_answer(finish: Optional[str], thought: Optional[int] = None) -> str:
+        """What the chat shows when PAIS ended the answer without a word of visible text.
+        `thought` is None when no reasoning field ever came: 0 would read as "it did not think"."""
+        seen = "생각 글자 수는 받지 못함" if thought is None else f"생각 {thought}자"
+        why = (f"모델이 답을 쓰기 전에 출력 한도(max_tokens)에 닿았습니다({seen})" if finish == "length"
+               else f"모델이 보이는 글 없이 답을 끝냈습니다(finish_reason={finish or '없음'}, {seen})")
+        # Leading blank lines: whitespace the model did send must not turn this into a code block.
+        return (f"\n\n답을 받지 못했습니다 -- {why}. 도구가 읽은 값은 있었을 수 있지만 화면에 옮겨지지 않았습니다. "
+                "같은 질문을 다시 보내거나, 대상을 하나로 좁혀 다시 물어보세요.")
 
     def stream_generator(self, response, __event_emitter__=None, hide: Optional[str] = None):
         """SSE(data: {...}) 스트림을 파싱해서 delta content만 순차적으로 yield한다.
@@ -1260,7 +1267,7 @@ class Pipe:
         filt = self._NextListFilter(self._HEAD, self._ITEM, self._OFFER_HEAD, self._QUOTED_ITEM) if hide else None
         # 159 2026-11-18 23:14: a three-tool answer streamed for 180 s and ended with no text at all,
         # so the chat showed an empty bubble and nothing said why. Count what came, and say so.
-        wrote, finish, thought = False, None, 0
+        wrote, finish, thought = False, None, None
         try:
             for line in response.iter_lines():
                 if not line:
@@ -1284,7 +1291,9 @@ class Pipe:
 
                 finish = choices[0].get("finish_reason") or finish
                 delta = choices[0].get("delta") or {}
-                thought += len(delta.get("reasoning_content") or delta.get("reasoning") or "")
+                for key in ("reasoning_content", "reasoning"):
+                    if key in delta:
+                        thought = (thought or 0) + len(delta.get(key) or "")
                 content = delta.get("content")
                 if content:
                     if filt is not None:
@@ -1301,7 +1310,10 @@ class Pipe:
                 self._remember(hide, filt.items)
                 filt = None  # remembered; the finally below must not forget it
             if not wrote:
-                logger.warning(f"pais pipe: empty answer (finish_reason={finish}, reasoning {thought} chars)")
+                hidden = len(self._next_lists.get(hide) or []) if hide else 0
+                logger.warning(f"pais pipe: empty answer (finish_reason={finish}, "
+                               f"reasoning {'not sent' if thought is None else f'{thought} chars'}, "
+                               f"hidden next-list items {hidden})")
                 yield self.empty_answer(finish, thought)
 
         except Exception as e:

@@ -484,7 +484,7 @@ class Pipe:
     _QLABEL = r"^\s*[Qq]\d+[.):]?\s*"
     # "나머지 보여줘" and its variants; a sentence with more in it is a new question.
     _PAGING = (
-        r"(?:나머지|다음|더|계속)\s*(?:도|를|은)?\s*(?:페이지|거|것)?\s*(?:도|를)?\s*"
+        r"(?:나머지|다음|더|계속|이어서)\s*(?:도|를|은|는)?\s*(?:페이지|거|것)?\s*(?:도|를)?\s*"
         r"(?:보여\s*줘|보여\s*주세요|보여\s*줄래|알려\s*줘|알려\s*주세요|줘|주세요|보기|해\s*줘)?[.!?]?"
         r"|more|next(?:\s*page)?|continue"
     )

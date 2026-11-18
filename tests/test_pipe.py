@@ -418,13 +418,13 @@ class TestPagingGoesAlone(unittest.TestCase):
         self.assertNotIn("행 생략", sent)
 
     def test_every_paging_spelling_goes_alone(self):
-        for word in ("나머지도 보여줘", "다음 페이지", "계속", "더 보여주세요", "more", "next page"):
+        for word in ("나머지도 보여줘", "나머지는?", "이어서 보여줘", "다음 페이지", "계속", "더 보여주세요", "more", "next page"):
             out = self.pipe._shape_history(chat("q", SPACE, word))
             self.assertEqual(len(out), 1, word)
 
     def test_a_new_question_keeps_its_history(self):
-        out = self.pipe._shape_history(chat("q", SPACE, "나머지 VM 중 꺼진 것만 보여줘"))
-        self.assertEqual(len(out), 3)
+        for word in ("나머지 VM 중 꺼진 것만 보여줘", "더 자세히 보여줘", "다음 단계는?", "계속 실패해", "이어서 설명해줘"):
+            self.assertEqual(len(self.pipe._shape_history(chat("q", SPACE, word))), 3, word)
 
     def test_full_history_mode_keeps_the_whole_chat(self):
         self.pipe.valves.HISTORY_MODE = "full"

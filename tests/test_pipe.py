@@ -395,5 +395,42 @@ class TestEarlierDataIsNotLeftToCopy(unittest.TestCase):
         self.assertIs(self.pipe._shape_history(messages), messages)
 
 
+class TestPagingGoesAlone(unittest.TestCase):
+    """159 BRCM-MCP #728, 11-18: in a ten-question chat "나머지 보여줘" after a gantt got no tool call three times out of
+    three -- no CALL in the gateway journal -- and the answer copied the stripped turns before it: a head line and
+    "(표 31행 생략 — 첫 열: …; 지금 값은 도구로 다시 조회)" with made-up counts. The same flow in a fresh chat called the tool."""
+
+    GANTT = "**VCF Operations** 에서 조회한 결과입니다.\n\n```mermaid\ngantt\n  title x\n```\n\n" + SPACE
+
+    def setUp(self):
+        self.pipe = P()
+
+    def test_a_paging_turn_is_sent_without_the_chat_before_it(self):
+        system = {"role": "system", "content": "s"}
+        out = self.pipe._shape_history([system] + chat("VM 목록 보여줘", SPACE, "나머지 보여줘", SPACE,
+                                                       "진행 중 알림 간트 차트로 그려줘", self.GANTT, "나머지 보여줘"))
+        self.assertEqual(out[0], system)
+        self.assertEqual(len(out), 2)
+        sent = out[-1]["content"]
+        self.assertTrue(sent.startswith("나머지 보여줘\n("))
+        self.assertIn('request="나머지 보여줘"', sent)
+        self.assertIn("한 번 호출", sent)
+        self.assertNotIn("행 생략", sent)
+
+    def test_every_paging_spelling_goes_alone(self):
+        for word in ("나머지도 보여줘", "다음 페이지", "계속", "더 보여주세요", "more", "next page"):
+            out = self.pipe._shape_history(chat("q", SPACE, word))
+            self.assertEqual(len(out), 1, word)
+
+    def test_a_new_question_keeps_its_history(self):
+        out = self.pipe._shape_history(chat("q", SPACE, "나머지 VM 중 꺼진 것만 보여줘"))
+        self.assertEqual(len(out), 3)
+
+    def test_full_history_mode_keeps_the_whole_chat(self):
+        self.pipe.valves.HISTORY_MODE = "full"
+        messages = chat("q", SPACE, "나머지 보여줘")
+        self.assertIs(self.pipe._shape_history(messages), messages)
+
+
 if __name__ == "__main__":
     unittest.main()

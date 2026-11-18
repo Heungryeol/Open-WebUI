@@ -689,8 +689,16 @@ class Pipe:
                     hit = re.search(r"(vcenter_query|nsx_query|ops_query|logs_query)", m.get("content", ""))
                     prev_tool = hit.group(1) if hit else None
                     break
-            hint = f"{prev_tool or '바로 앞 답의 도구'} 를 request=\"나머지 보여줘\" 로 호출"
-            current = {"role": "user", "content": f"{cur_text}\n({hint})"}
+            # "나머지 보여줘" after a few stripped answers was answered with no tool call, in the shape of those answers: a
+            # head line, "(표 31행 생략 — 첫 열: …; 지금 값은 도구로 다시 조회)" with counts the model made up, and no CALL in
+            # the gateway journal (159 BRCM-MCP #728, 11-18: three of three after a gantt in a ten-question chat, while
+            # the same flow in a fresh chat called the tool every time) -- an earlier stripped turn in view is an example
+            # of answering one without a tool. The gateway, not the model, keeps which list goes on (Turn.last_product
+            # and the products' paging), so the turn goes alone. No valve on purpose: a new valve can empty the saved
+            # ones when the code is replaced (README, 10-22); HISTORY_MODE=full gives the whole chat as before.
+            hint = (f"{prev_tool or '앞 답을 낸 도구(모르면 vcenter_query)'} 를 request=\"나머지 보여줘\" 로 한 번 호출하고 "
+                    "그 결과만 답함 -- 앞 답은 이 대화에 없음, 어느 목록을 이을지는 서버가 앎")
+            return system + [{"role": "user", "content": f"{cur_text}\n({hint})"}]
         elif (
             self.valves.FOLLOWUP_HINT
             and len(bare) <= int(self.valves.FOLLOWUP_MAX_CHARS)

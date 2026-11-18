@@ -316,6 +316,11 @@ class TestEmptyAnswer(unittest.TestCase):
         self.assertIn("생각 글자 수는 받지 못함", out)
         self.assertNotIn("생각 0자", out)
 
+    def test_a_null_reasoning_field_is_not_zero_thought(self):
+        out = "".join(P().stream_generator(Chunks(
+            {"delta": {"content": "", "reasoning_content": None}}, {"delta": {}, "finish_reason": "length"})))
+        self.assertIn("생각 글자 수는 받지 못함", out)
+
     def test_whitespace_sent_does_not_make_the_notice_a_code_block(self):
         out = "".join(P().stream_generator(Chunks({"delta": {"content": "    "}, "finish_reason": "stop"})))
         self.assertIn("    \n\n답을 받지 못했습니다", out)

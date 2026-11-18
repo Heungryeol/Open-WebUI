@@ -1229,7 +1229,7 @@ class Pipe:
                 text = (choice.get("message") or {}).get("content") or ""
                 if not text.strip():
                     message = choice.get("message") or {}
-                    said = [k for k in ("reasoning_content", "reasoning") if k in message]
+                    said = [k for k in ("reasoning_content", "reasoning") if message.get(k) is not None]
                     thought = sum(len(message.get(k) or "") for k in said) if said else None
                     logger.warning(f"pais pipe: empty answer (finish_reason={choice.get('finish_reason')}, "
                                    f"reasoning {'not sent' if thought is None else f'{thought} chars'})")
@@ -1292,7 +1292,7 @@ class Pipe:
                 finish = choices[0].get("finish_reason") or finish
                 delta = choices[0].get("delta") or {}
                 for key in ("reasoning_content", "reasoning"):
-                    if key in delta:
+                    if delta.get(key) is not None:  # vLLM-style servers send null when nothing came
                         thought = (thought or 0) + len(delta.get(key) or "")
                 content = delta.get("content")
                 if content:

@@ -276,6 +276,46 @@ class TestHiddenList(unittest.TestCase):
         self.assertIsNone(p._hiding({"chat_id": "c"}))
 
 
+class Chunks:
+    """An SSE response given chunk by chunk (finish_reason, reasoning)."""
+
+    def __init__(self, *chunks):
+        self.chunks = chunks
+
+    def iter_lines(self):
+        for c in self.chunks:
+            yield "data: " + json.dumps({"choices": [c]})
+        yield "data: [DONE]"
+
+    def close(self):
+        pass
+
+
+class TestEmptyAnswer(unittest.TestCase):
+    """159 2026-11-18: three tool calls, 180 s of stream, no text -- an empty bubble."""
+
+    def test_an_answer_with_no_text_says_so_and_why(self):
+        p = P()
+        out = "".join(p.stream_generator(Chunks(
+            {"delta": {"reasoning_content": "x" * 40}}, {"delta": {}, "finish_reason": "length"})))
+        self.assertIn("답을 받지 못했습니다", out)
+        self.assertIn("max_tokens", out)
+        self.assertIn("40자", out)
+
+    def test_another_end_names_its_reason(self):
+        out = "".join(P().stream_generator(Chunks({"delta": {"content": "  \n"}, "finish_reason": "stop"})))
+        self.assertIn("finish_reason=stop", out)
+
+    def test_an_answer_with_text_is_untouched(self):
+        out = "".join(P().stream_generator(Chunks({"delta": {"content": "알림 3건"}, "finish_reason": "stop"})))
+        self.assertEqual(out, "알림 3건")
+
+    def test_only_a_hidden_list_still_counts_as_text_shown(self):
+        p = P()
+        out = "".join(p.stream_generator(Stream("이어서 물어볼 만한 것:\n- esx10 보여줘\n"), None, "c9"))
+        self.assertIn("답을 받지 못했습니다", out)  # nothing visible reached the chat
+
+
 class TestTasks(unittest.TestCase):
     def test_tasks_never_reach_pais(self):
         p = P()

@@ -1225,7 +1225,12 @@ class Pipe:
             else:
                 data = response.json()
                 response.close()
-                return self.strip_next_list(data["choices"][0]["message"]["content"], hide)
+                choice = (data.get("choices") or [{}])[0]
+                text = (choice.get("message") or {}).get("content") or ""
+                if not text.strip():
+                    logger.warning(f"pais pipe: empty answer (finish_reason={choice.get('finish_reason')})")
+                    return self.empty_answer(choice.get("finish_reason"))
+                return self.strip_next_list(text, hide)
 
         except httpx.TimeoutException as e:
             return (
@@ -1238,6 +1243,14 @@ class Pipe:
             logger.error(f"예상치 못한 오류: {e}")
             return f"Error: 예상치 못한 오류가 발생했습니다: {str(e)}"
 
+    @staticmethod
+    def empty_answer(finish: Optional[str], thought: int = 0) -> str:
+        """What the chat shows when PAIS ended the answer without a word of text."""
+        why = (f"모델이 답을 쓰기 전에 출력 한도(max_tokens)에 닿았습니다(생각 {thought}자)" if finish == "length"
+               else f"모델이 빈 답으로 끝냈습니다(finish_reason={finish or '없음'}, 생각 {thought}자)")
+        return (f"답을 받지 못했습니다 -- {why}. 도구가 읽은 값은 있었을 수 있지만 화면에 옮겨지지 않았습니다. "
+                "같은 질문을 다시 보내거나, 대상을 하나로 좁혀 물어보세요(예: 인프라 이름 + \"주요 이슈 정리해줘\").")
+
     def stream_generator(self, response, __event_emitter__=None, hide: Optional[str] = None):
         """SSE(data: {...}) 스트림을 파싱해서 delta content만 순차적으로 yield한다.
         공용 persistent client는 여기서 닫지 않고 response만 닫아 커넥션(keep-alive)을
@@ -1245,6 +1258,9 @@ class Pipe:
         import json
 
         filt = self._NextListFilter(self._HEAD, self._ITEM, self._OFFER_HEAD, self._QUOTED_ITEM) if hide else None
+        # 159 2026-11-18 23:14: a three-tool answer streamed for 180 s and ended with no text at all,
+        # so the chat showed an empty bubble and nothing said why. Count what came, and say so.
+        wrote, finish, thought = False, None, 0
         try:
             for line in response.iter_lines():
                 if not line:
@@ -1266,20 +1282,27 @@ class Pipe:
                 if not choices:
                     continue
 
-                delta = choices[0].get("delta", {})
+                finish = choices[0].get("finish_reason") or finish
+                delta = choices[0].get("delta") or {}
+                thought += len(delta.get("reasoning_content") or delta.get("reasoning") or "")
                 content = delta.get("content")
                 if content:
                     if filt is not None:
                         content = filt.feed(content)
                     if content:
+                        wrote = wrote or bool(content.strip())
                         yield content
 
             if filt is not None:
                 tail = filt.flush()
                 if tail:
+                    wrote = wrote or bool(tail.strip())
                     yield tail
                 self._remember(hide, filt.items)
                 filt = None  # remembered; the finally below must not forget it
+            if not wrote:
+                logger.warning(f"pais pipe: empty answer (finish_reason={finish}, reasoning {thought} chars)")
+                yield self.empty_answer(finish, thought)
 
         except Exception as e:
             logger.error(f"스트리밍 처리 중 오류: {e}")

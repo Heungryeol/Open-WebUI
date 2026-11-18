@@ -415,6 +415,8 @@ class TestPagingGoesAlone(unittest.TestCase):
         self.assertTrue(sent.startswith("나머지 보여줘\n("))
         self.assertIn('request="나머지 보여줘"', sent)
         self.assertIn("한 번 호출", sent)
+        self.assertIn("그대로 옮김", sent)
+        self.assertIn("차트 블록", sent)
         self.assertNotIn("행 생략", sent)
 
     def test_every_paging_spelling_goes_alone(self):

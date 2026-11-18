@@ -696,8 +696,11 @@ class Pipe:
             # of answering one without a tool. The gateway, not the model, keeps which list goes on (Turn.last_product
             # and the products' paging), so the turn goes alone. No valve on purpose: a new valve can empty the saved
             # ones when the code is replaced (README, 10-22); HISTORY_MODE=full gives the whole chat as before.
+            # "그 결과만 답함" alone was read as "sum it up": 159 11-18 the rest's gantt block and head line were dropped and a sentence of
+            # the model's own ("vCenter에서 발생한 …" for Operations alerts) took their place. Say what to keep.
             hint = (f"{prev_tool or '앞 답을 낸 도구(모르면 vcenter_query)'} 를 request=\"나머지 보여줘\" 로 한 번 호출하고 "
-                    "그 결과만 답함 -- 앞 답은 이 대화에 없음, 어느 목록을 이을지는 서버가 앎")
+                    "그 답을 고치지 않고 그대로 옮김(첫 줄, ``` 차트 블록, 표, 끝 줄 모두) -- 앞 답은 이 대화에 없음, "
+                    "어느 목록을 이을지는 서버가 앎")
             return system + [{"role": "user", "content": f"{cur_text}\n({hint})"}]
         elif (
             self.valves.FOLLOWUP_HINT
